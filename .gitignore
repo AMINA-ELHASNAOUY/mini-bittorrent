@@ -1,0 +1,11 @@
+# Binaries
+mini-bittorrent
+*.exe
+*.test
+
+# Downloaded torrent test files
+*.torrent
+downloads/
+
+# OS junk
+.DS_Store
