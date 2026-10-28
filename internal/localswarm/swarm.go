@@ -28,15 +28,32 @@ type SeederSpec struct {
 	Latency time.Duration // simulated delay per block served
 }
 
-// Start launches a tracker and one seeder per spec, all on 127.0.0.1.
+// Start launches a tracker and one seeder per spec for a single file, all on 127.0.0.1.
 func Start(name string, data []byte, pieceLength int, specs []SeederSpec) (*Swarm, error) {
+	return start(data, pieceLength, specs, func(announce string) ([]byte, error) {
+		return torrentfile.Create(announce, name, int64(pieceLength), data)
+	})
+}
+
+// StartMulti is Start for a multi-file torrent whose root directory is name.
+func StartMulti(name string, files []torrentfile.FileData, pieceLength int, specs []SeederSpec) (*Swarm, error) {
+	var data []byte
+	for _, f := range files {
+		data = append(data, f.Data...)
+	}
+	return start(data, pieceLength, specs, func(announce string) ([]byte, error) {
+		return torrentfile.CreateMulti(announce, name, int64(pieceLength), files)
+	})
+}
+
+func start(data []byte, pieceLength int, specs []SeederSpec, makeTorrent func(announce string) ([]byte, error)) (*Swarm, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
 	}
 	sw := &Swarm{ln: ln}
 
-	raw, err := torrentfile.Create("http://"+ln.Addr().String()+"/announce", name, int64(pieceLength), data)
+	raw, err := makeTorrent("http://" + ln.Addr().String() + "/announce")
 	if err != nil {
 		ln.Close()
 		return nil, err

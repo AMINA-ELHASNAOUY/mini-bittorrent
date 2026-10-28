@@ -34,6 +34,7 @@ type Torrent struct {
 	PieceLength int64
 	Length      int64
 	Logger      *log.Logger // optional; nil discards per-peer logs
+	Completed   []bool      // optional; pieces already on disk and verified (resume)
 }
 
 // Progress is reported after every verified piece.
@@ -72,15 +73,23 @@ func (t *Torrent) logf(format string, args ...interface{}) {
 // Download fetches every piece and writes it into out at its file offset.
 // onProgress (optional) is called after each verified piece.
 func (t *Torrent) Download(out io.WriterAt, onProgress func(Progress)) error {
-	if len(t.Peers) == 0 {
-		return errors.New("no peers to download from")
-	}
 	numPieces := len(t.PieceHashes)
 	workQueue := make(chan *pieceWork, numPieces)
 	results := make(chan *pieceResult)
+	done := 0
 	for i, hash := range t.PieceHashes {
+		if i < len(t.Completed) && t.Completed[i] {
+			done++
+			continue
+		}
 		begin, end := t.pieceBounds(i)
 		workQueue <- &pieceWork{index: i, hash: hash, length: int(end - begin)}
+	}
+	if done == numPieces {
+		return nil
+	}
+	if len(t.Peers) == 0 {
+		return errors.New("no peers to download from")
 	}
 
 	var (
@@ -106,7 +115,6 @@ func (t *Torrent) Download(out io.WriterAt, onProgress func(Progress)) error {
 		close(allWorkersGone)
 	}()
 
-	done := 0
 	for done < numPieces {
 		select {
 		case res := <-results:
@@ -244,15 +252,33 @@ func (t *Torrent) downloadPiece(c *peer.Client, pw *pieceWork) ([]byte, error) {
 	return buf, nil
 }
 
-// VerifyFile re-reads a finished download and checks every piece hash.
-func (t *Torrent) VerifyFile(r io.ReaderAt) error {
+// CheckPieces hashes what is already on disk and reports which pieces are
+// complete and valid, so an interrupted download can skip them.
+func (t *Torrent) CheckPieces(r io.ReaderAt) ([]bool, int, error) {
+	have := make([]bool, len(t.PieceHashes))
+	count := 0
 	for i, want := range t.PieceHashes {
 		begin, end := t.pieceBounds(i)
 		buf := make([]byte, end-begin)
 		if _, err := r.ReadAt(buf, begin); err != nil && !errors.Is(err, io.EOF) {
-			return err
+			return nil, 0, err
 		}
-		if got := sha1.Sum(buf); !bytes.Equal(got[:], want[:]) {
+		if got := sha1.Sum(buf); bytes.Equal(got[:], want[:]) {
+			have[i] = true
+			count++
+		}
+	}
+	return have, count, nil
+}
+
+// VerifyFile re-reads a finished download and checks every piece hash.
+func (t *Torrent) VerifyFile(r io.ReaderAt) error {
+	have, _, err := t.CheckPieces(r)
+	if err != nil {
+		return err
+	}
+	for i, ok := range have {
+		if !ok {
 			return fmt.Errorf("piece %d does not match its hash", i)
 		}
 	}
