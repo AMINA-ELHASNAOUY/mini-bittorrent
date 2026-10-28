@@ -82,6 +82,11 @@ func (c *Client) SendRequest(index, begin, length int) error {
 	return c.send(FormatRequest(index, begin, length))
 }
 
+// SendCancel withdraws a block request.
+func (c *Client) SendCancel(index, begin, length int) error {
+	return c.send(FormatCancel(index, begin, length))
+}
+
 // SendHave announces that we finished a piece.
 func (c *Client) SendHave(index int) error { return c.send(FormatHave(index)) }
 

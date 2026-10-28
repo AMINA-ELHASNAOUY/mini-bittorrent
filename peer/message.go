@@ -115,3 +115,10 @@ func ParsePiece(index int, buf []byte, m *Message) (int, error) {
 	}
 	return copy(buf[begin:], data), nil
 }
+
+// FormatCancel builds a CANCEL message withdrawing an earlier REQUEST.
+func FormatCancel(index, begin, length int) *Message {
+	m := FormatRequest(index, begin, length)
+	m.ID = MsgCancel
+	return m
+}

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"mini-bittorrent/internal/localswarm"
 	"mini-bittorrent/storage"
@@ -210,5 +211,59 @@ func TestMultiFileDownload(t *testing.T) {
 		if err != nil || !bytes.Equal(got, f.Data) {
 			t.Errorf("%v differs from the original (err %v)", f.Path, err)
 		}
+	}
+}
+
+func TestStallsWhenPiecesAreMissingFromSwarm(t *testing.T) {
+	// The only seeder lacks piece 3, so the download can never finish.
+	data := randomData(t, 6*16384)
+	tor := setup(t, data, 16384, []localswarm.SeederSpec{{Has: func(i int) bool { return i != 3 }}})
+	tor.StallTimeout = 300 * time.Millisecond
+
+	start := time.Now()
+	err := tor.Download(&memFile{buf: make([]byte, len(data))}, nil)
+	if err == nil {
+		t.Fatal("expected a stall error")
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Errorf("took %s to detect the stall", time.Since(start))
+	}
+}
+
+func TestPeerThatChokesMidPiece(t *testing.T) {
+	// The seeder chokes us every 3 blocks and drops our pending requests,
+	// so the downloader must re-request them after each unchoke.
+	data := randomData(t, 4*65536+5000)
+	tor := setup(t, data, 65536, []localswarm.SeederSpec{{ChokeEvery: 3}})
+
+	out := &memFile{buf: make([]byte, len(data))}
+	if err := tor.Download(out, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(out.buf, data) {
+		t.Fatal("downloaded bytes differ from the original")
+	}
+}
+
+func TestEndgameFinishesDespiteSlowPeer(t *testing.T) {
+	// One very slow seeder and one fast one. Without endgame the last piece
+	// could sit on the slow peer for seconds; with it the fast peer takes over.
+	data := randomData(t, 4*32768)
+	tor := setup(t, data, 32768, []localswarm.SeederSpec{
+		{Latency: 400 * time.Millisecond},
+		{},
+	})
+
+	start := time.Now()
+	out := &memFile{buf: make([]byte, len(data))}
+	if err := tor.Download(out, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(out.buf, data) {
+		t.Fatal("downloaded bytes differ from the original")
+	}
+	// The slow peer alone would need 2 blocks × 400ms for its piece.
+	if elapsed := time.Since(start); elapsed > 700*time.Millisecond {
+		t.Errorf("took %s; endgame should let the fast peer finish the slow peer's piece", elapsed)
 	}
 }

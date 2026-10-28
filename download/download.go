@@ -5,10 +5,12 @@ package download
 import (
 	"bytes"
 	"crypto/sha1"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"sync"
 	"time"
 
@@ -20,6 +22,8 @@ const (
 	BlockSize = 16384
 	// MaxBacklog is how many block requests we keep in flight per peer (pipelining).
 	MaxBacklog = 5
+	// maxEndgameCopies caps how many peers may fetch the same piece in endgame.
+	maxEndgameCopies = 3
 	// maxBadPieces drops a peer after it sends this many pieces that fail the hash check.
 	maxBadPieces = 3
 	pieceTimeout = 30 * time.Second
@@ -35,18 +39,16 @@ type Torrent struct {
 	Length      int64
 	Logger      *log.Logger // optional; nil discards per-peer logs
 	Completed   []bool      // optional; pieces already on disk and verified (resume)
+
+	// StallTimeout ends the download with an error when the remaining pieces
+	// are unavailable from every connected peer for this long (default 30s).
+	StallTimeout time.Duration
 }
 
 // Progress is reported after every verified piece.
 type Progress struct {
 	Done, Total int
 	Peers       int // peers currently connected
-}
-
-type pieceWork struct {
-	index  int
-	hash   [20]byte
-	length int
 }
 
 type pieceResult struct {
@@ -70,26 +72,20 @@ func (t *Torrent) logf(format string, args ...interface{}) {
 	}
 }
 
-// Download fetches every piece and writes it into out at its file offset.
+// Download fetches every missing piece and writes it into out at its offset.
 // onProgress (optional) is called after each verified piece.
 func (t *Torrent) Download(out io.WriterAt, onProgress func(Progress)) error {
 	numPieces := len(t.PieceHashes)
-	workQueue := make(chan *pieceWork, numPieces)
-	results := make(chan *pieceResult)
-	done := 0
-	for i, hash := range t.PieceHashes {
-		if i < len(t.Completed) && t.Completed[i] {
-			done++
-			continue
-		}
-		begin, end := t.pieceBounds(i)
-		workQueue <- &pieceWork{index: i, hash: hash, length: int(end - begin)}
-	}
-	if done == numPieces {
+	pk := newPicker(numPieces, t.Completed)
+	if pk.finished() {
 		return nil
 	}
 	if len(t.Peers) == 0 {
 		return errors.New("no peers to download from")
+	}
+	stallTimeout := t.StallTimeout
+	if stallTimeout == 0 {
+		stallTimeout = 30 * time.Second
 	}
 
 	var (
@@ -97,12 +93,14 @@ func (t *Torrent) Download(out io.WriterAt, onProgress func(Progress)) error {
 		mu     sync.Mutex
 		active int
 	)
+	results := make(chan *pieceResult)
 	stop := make(chan struct{})
+	defer close(stop)
 	for _, addr := range t.Peers {
 		wg.Add(1)
 		go func(addr string) {
 			defer wg.Done()
-			t.runWorker(addr, workQueue, results, stop, func(delta int) {
+			t.runWorker(addr, pk, results, stop, func(delta int) {
 				mu.Lock()
 				active += delta
 				mu.Unlock()
@@ -115,14 +113,23 @@ func (t *Torrent) Download(out io.WriterAt, onProgress func(Progress)) error {
 		close(allWorkersGone)
 	}()
 
-	for done < numPieces {
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	var stalledSince time.Time
+	done := numPieces - pk.remainingCount()
+
+	for !pk.finished() {
 		select {
 		case res := <-results:
+			if pk.isDone(res.index) { // endgame duplicate: someone else was faster
+				pk.release(res.index)
+				continue
+			}
 			begin, _ := t.pieceBounds(res.index)
 			if _, err := out.WriteAt(res.buf, begin); err != nil {
-				close(stop)
 				return fmt.Errorf("writing piece %d: %w", res.index, err)
 			}
+			pk.complete(res.index)
 			done++
 			if onProgress != nil {
 				mu.Lock()
@@ -132,22 +139,34 @@ func (t *Torrent) Download(out io.WriterAt, onProgress func(Progress)) error {
 			}
 		case <-allWorkersGone:
 			return fmt.Errorf("all peers disconnected with %d of %d pieces done", done, numPieces)
+		case <-ticker.C:
+			if !pk.stalled() {
+				stalledSince = time.Time{}
+			} else if stalledSince.IsZero() {
+				stalledSince = time.Now()
+			} else if time.Since(stalledSince) > stallTimeout {
+				return fmt.Errorf("stalled: no connected peer has the remaining pieces (%d of %d done)", done, numPieces)
+			}
 		}
 	}
-	close(stop)
 	return nil
 }
 
-// runWorker downloads pieces from a single peer until the queue is empty,
-// the peer misbehaves, or the connection fails. Unfinished work is always
-// put back on the queue so another peer can pick it up.
-func (t *Torrent) runWorker(addr string, workQueue chan *pieceWork, results chan<- *pieceResult, stop <-chan struct{}, track func(int)) {
+// errPieceTaken means another worker finished this piece first (endgame).
+var errPieceTaken = errors.New("piece completed by another peer")
+
+// runWorker downloads pieces from a single peer until the download is done,
+// the peer misbehaves, or the connection fails. A piece that isn't finished
+// is released back to the picker so another peer can take it.
+func (t *Torrent) runWorker(addr string, pk *picker, results chan<- *pieceResult, stop <-chan struct{}, track func(int)) {
 	c, err := peer.Dial(addr, t.InfoHash, t.PeerID, len(t.PieceHashes))
 	if err != nil {
 		t.logf("peer %s: could not connect: %v", addr, err)
 		return
 	}
 	defer c.Close()
+	pk.addPeer(c.Bitfield)
+	defer func() { pk.removePeer(c.Bitfield) }()
 	track(+1)
 	defer track(-1)
 	t.logf("peer %s: connected", addr)
@@ -155,35 +174,38 @@ func (t *Torrent) runWorker(addr string, workQueue chan *pieceWork, results chan
 	c.SendUnchoke()
 	c.SendInterested()
 
-	badPieces, misses := 0, 0
+	badPieces := 0
 	for {
-		var pw *pieceWork
 		select {
-		case pw = <-workQueue:
 		case <-stop:
 			return
+		default:
 		}
 
-		if !c.Bitfield.HasPiece(pw.index) {
-			workQueue <- pw
-			misses++
-			if misses > len(t.PieceHashes) { // cycled through everything: nothing left for this peer
+		index := pk.next(c.Bitfield)
+		if index < 0 {
+			// Nothing to fetch from this peer right now: listen for HAVE
+			// messages for a moment, then ask the picker again.
+			if err := t.idle(c, pk, time.Second); err != nil {
 				return
 			}
 			continue
 		}
-		misses = 0
 
-		buf, err := t.downloadPiece(c, pw)
+		buf, err := t.downloadPiece(c, pk, index)
+		if errors.Is(err, errPieceTaken) {
+			pk.release(index)
+			continue
+		}
 		if err != nil {
-			t.logf("peer %s: piece %d failed: %v", addr, pw.index, err)
-			workQueue <- pw
+			pk.release(index)
+			t.logf("peer %s: piece %d failed: %v", addr, index, err)
 			return
 		}
-		if sha1.Sum(buf) != pw.hash {
+		if sha1.Sum(buf) != t.PieceHashes[index] {
+			pk.release(index)
 			badPieces++
-			t.logf("peer %s: piece %d failed the hash check (%d/%d)", addr, pw.index, badPieces, maxBadPieces)
-			workQueue <- pw
+			t.logf("peer %s: piece %d failed the hash check (%d/%d)", addr, index, badPieces, maxBadPieces)
 			if badPieces >= maxBadPieces {
 				t.logf("peer %s: dropped for sending corrupt data", addr)
 				return
@@ -191,36 +213,92 @@ func (t *Torrent) runWorker(addr string, workQueue chan *pieceWork, results chan
 			continue
 		}
 
-		c.SendHave(pw.index)
+		c.SendHave(index)
 		select {
-		case results <- &pieceResult{index: pw.index, buf: buf}:
+		case results <- &pieceResult{index: index, buf: buf}:
 		case <-stop:
 			return
 		}
 	}
 }
 
-// downloadPiece requests a piece block by block, keeping up to MaxBacklog
-// requests in flight while the peer has us unchoked.
-func (t *Torrent) downloadPiece(c *peer.Client, pw *pieceWork) ([]byte, error) {
-	buf := make([]byte, pw.length)
-	downloaded, requested, backlog := 0, 0, 0
+// idle reads messages from a peer we have nothing to ask for, so we notice
+// when it announces new pieces. A read timeout is normal and not an error.
+func (t *Torrent) idle(c *peer.Client, pk *picker, d time.Duration) error {
+	c.Conn.SetReadDeadline(time.Now().Add(d))
+	defer c.Conn.SetReadDeadline(time.Time{})
+	for {
+		msg, err := c.Read()
+		if err != nil {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				return nil
+			}
+			return err
+		}
+		handleStateMessage(c, pk, msg)
+	}
+}
+
+// handleStateMessage applies CHOKE/UNCHOKE/HAVE. It reports whether msg was one of them.
+func handleStateMessage(c *peer.Client, pk *picker, msg *peer.Message) bool {
+	if msg == nil {
+		return true // keep-alive
+	}
+	switch msg.ID {
+	case peer.MsgUnchoke:
+		c.Choked = false
+	case peer.MsgChoke:
+		c.Choked = true
+	case peer.MsgHave:
+		if idx, err := peer.ParseHave(msg); err == nil && !c.Bitfield.HasPiece(idx) {
+			c.Bitfield.SetPiece(idx)
+			pk.have(idx)
+		}
+	default:
+		return false
+	}
+	return true
+}
+
+// downloadPiece fetches one piece block by block, keeping up to MaxBacklog
+// requests in flight. If the peer chokes us, its pending requests are
+// dropped (as the protocol says) and re-sent after the next unchoke. In
+// endgame it gives up as soon as another worker completes the same piece.
+func (t *Torrent) downloadPiece(c *peer.Client, pk *picker, index int) ([]byte, error) {
+	begin, end := t.pieceBounds(index)
+	length := int(end - begin)
+	buf := make([]byte, length)
+
+	numBlocks := (length + BlockSize - 1) / BlockSize
+	const (
+		pending = iota
+		requested
+		received
+	)
+	state := make([]int, numBlocks)
+	blockLen := func(b int) int {
+		if b == numBlocks-1 {
+			return length - b*BlockSize
+		}
+		return BlockSize
+	}
+	inFlight, got := 0, 0
 
 	c.Conn.SetDeadline(time.Now().Add(pieceTimeout))
 	defer c.Conn.SetDeadline(time.Time{})
 
-	for downloaded < pw.length {
+	for got < numBlocks {
 		if !c.Choked {
-			for backlog < MaxBacklog && requested < pw.length {
-				size := BlockSize
-				if pw.length-requested < size {
-					size = pw.length - requested
+			for b := 0; b < numBlocks && inFlight < MaxBacklog; b++ {
+				if state[b] != pending {
+					continue
 				}
-				if err := c.SendRequest(pw.index, requested, size); err != nil {
+				if err := c.SendRequest(index, b*BlockSize, blockLen(b)); err != nil {
 					return nil, err
 				}
-				backlog++
-				requested += size
+				state[b] = requested
+				inFlight++
 			}
 		}
 
@@ -228,25 +306,43 @@ func (t *Torrent) downloadPiece(c *peer.Client, pw *pieceWork) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		if msg == nil { // keep-alive
+		wasChoked := c.Choked
+		if handleStateMessage(c, pk, msg) {
+			if c.Choked && !wasChoked { // requests are discarded on choke
+				for b := range state {
+					if state[b] == requested {
+						state[b] = pending
+					}
+				}
+				inFlight = 0
+			}
 			continue
 		}
-		switch msg.ID {
-		case peer.MsgUnchoke:
-			c.Choked = false
-		case peer.MsgChoke:
-			c.Choked = true
-		case peer.MsgHave:
-			if idx, err := peer.ParseHave(msg); err == nil {
-				c.Bitfield.SetPiece(idx)
+		if msg.ID != peer.MsgPiece || len(msg.Payload) < 8 {
+			continue
+		}
+		if int(binary.BigEndian.Uint32(msg.Payload[0:4])) != index {
+			continue // late block from a piece we abandoned
+		}
+		off := int(binary.BigEndian.Uint32(msg.Payload[4:8]))
+		b := off / BlockSize
+		if off%BlockSize != 0 || b >= numBlocks || state[b] != requested || len(msg.Payload)-8 != blockLen(b) {
+			continue // unrequested, duplicate or malformed block
+		}
+		if _, err := peer.ParsePiece(index, buf, msg); err != nil {
+			return nil, err
+		}
+		state[b] = received
+		inFlight--
+		got++
+
+		if got < numBlocks && pk.isDone(index) {
+			for b := range state {
+				if state[b] == requested {
+					c.SendCancel(index, b*BlockSize, blockLen(b))
+				}
 			}
-		case peer.MsgPiece:
-			n, err := peer.ParsePiece(pw.index, buf, msg)
-			if err != nil {
-				return nil, err
-			}
-			downloaded += n
-			backlog--
+			return nil, errPieceTaken
 		}
 	}
 	return buf, nil

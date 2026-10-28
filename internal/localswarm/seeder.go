@@ -22,6 +22,7 @@ type Seeder struct {
 	Has         func(index int) bool // nil = has every piece
 	Corrupt     bool                 // flip a byte in every block it sends
 	Latency     time.Duration        // simulated network delay per block
+	ChokeEvery  int                  // if > 0, choke the downloader after every N blocks served
 
 	ln     net.Listener
 	wg     sync.WaitGroup
@@ -107,6 +108,7 @@ func (s *Seeder) serve(conn net.Conn) {
 		return
 	}
 
+	served := 0
 	for {
 		msg, err := peer.ReadMessage(conn)
 		if err != nil {
@@ -143,6 +145,30 @@ func (s *Seeder) serve(conn net.Conn) {
 			if _, err := conn.Write((&peer.Message{ID: peer.MsgPiece, Payload: payload}).Serialize()); err != nil {
 				return
 			}
+			served++
+			if s.ChokeEvery > 0 && served%s.ChokeEvery == 0 && !s.chokeCycle(conn) {
+				return
+			}
 		}
 	}
+}
+
+// chokeCycle chokes the peer, ignores whatever it requests while choked
+// (as real clients do), then unchokes it again.
+func (s *Seeder) chokeCycle(conn net.Conn) bool {
+	if _, err := conn.Write((&peer.Message{ID: peer.MsgChoke}).Serialize()); err != nil {
+		return false
+	}
+	conn.SetReadDeadline(time.Now().Add(30 * time.Millisecond))
+	for {
+		if _, err := peer.ReadMessage(conn); err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				break
+			}
+			return false
+		}
+	}
+	conn.SetReadDeadline(time.Time{})
+	_, err := conn.Write((&peer.Message{ID: peer.MsgUnchoke}).Serialize())
+	return err == nil
 }

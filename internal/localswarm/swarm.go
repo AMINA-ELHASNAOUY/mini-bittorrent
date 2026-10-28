@@ -23,9 +23,10 @@ type Swarm struct {
 
 // SeederSpec configures one seeder in the swarm.
 type SeederSpec struct {
-	Has     func(index int) bool // nil = every piece
-	Corrupt bool
-	Latency time.Duration // simulated delay per block served
+	Has        func(index int) bool // nil = every piece
+	Corrupt    bool
+	Latency    time.Duration // simulated delay per block served
+	ChokeEvery int           // choke the downloader after every N blocks
 }
 
 // Start launches a tracker and one seeder per spec for a single file, all on 127.0.0.1.
@@ -66,7 +67,7 @@ func start(data []byte, pieceLength int, specs []SeederSpec, makeTorrent func(an
 	}
 
 	for i, spec := range specs {
-		s := &Seeder{Data: data, PieceLength: pieceLength, InfoHash: tf.InfoHash, Has: spec.Has, Corrupt: spec.Corrupt, Latency: spec.Latency}
+		s := &Seeder{Data: data, PieceLength: pieceLength, InfoHash: tf.InfoHash, Has: spec.Has, Corrupt: spec.Corrupt, Latency: spec.Latency, ChokeEvery: spec.ChokeEvery}
 		copy(s.PeerID[:], "-LS0001-seeder-"+strconv.Itoa(i))
 		if err := s.Start(); err != nil {
 			sw.Close()
