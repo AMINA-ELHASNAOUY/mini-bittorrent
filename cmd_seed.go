@@ -19,22 +19,23 @@ func runSeed(args []string) error {
 	fs := flag.NewFlagSet("seed", flag.ContinueOnError)
 	port := fs.Int("port", 6881, "TCP port to accept peers on")
 	verbose := fs.Bool("v", false, "log per-peer events")
+	limit := fs.Int64("limit", 0, "upload limit in KiB/s (0 = unlimited)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 2 {
-		return errors.New("usage: mini-bittorrent seed [-port N] [-v] <file.torrent> <path to the downloaded file or folder>")
+		return errors.New("usage: mini-bittorrent seed [-port N] [-limit KiB/s] [-v] <file.torrent> <path to the downloaded file or folder>")
 	}
 	tf, err := torrentfile.Open(fs.Arg(0))
 	if err != nil {
 		return err
 	}
-	return seedTorrent(tf, fs.Arg(1), *port, *verbose)
+	return seedTorrent(tf, fs.Arg(1), *port, *limit, *verbose)
 }
 
 // seedTorrent verifies the data at path, then serves it to peers and keeps
 // the trackers informed until Ctrl+C.
-func seedTorrent(tf *torrentfile.TorrentFile, path string, port int, verbose bool) error {
+func seedTorrent(tf *torrentfile.TorrentFile, path string, port int, limitKiB int64, verbose bool) error {
 	st, err := storage.OpenExisting(path, tf)
 	if err != nil {
 		return err
@@ -48,6 +49,7 @@ func seedTorrent(tf *torrentfile.TorrentFile, path string, port int, verbose boo
 	srv := &seed.Server{
 		InfoHash: tf.InfoHash, PeerID: peerID, PieceHashes: tf.PieceHashes,
 		PieceLength: tf.PieceLength, Length: tf.Length, Data: st, Info: tf.InfoBytes,
+		RateLimit: limitKiB * 1024,
 	}
 	if verbose {
 		srv.Logger = log.New(clearLine{os.Stdout}, "  ", log.Ltime)
@@ -68,6 +70,9 @@ func seedTorrent(tf *torrentfile.TorrentFile, path string, port int, verbose boo
 	defer srv.Close()
 	fmt.Printf("→ seeding %d/%d pieces on port %d (peers behind your router can only reach you if this port is forwarded)\n",
 		srv.Have(), len(tf.PieceHashes), srv.Port())
+	if limitKiB > 0 {
+		fmt.Printf("→ upload limited to %d KiB/s, uploading to %d peers at a time\n", limitKiB, 4)
+	}
 
 	announce := func() {
 		left := tf.Length * int64(len(tf.PieceHashes)-srv.Have()) / int64(len(tf.PieceHashes))

@@ -18,7 +18,7 @@ Usage:
         show what's inside a .torrent
   mini-bittorrent download [-o path] [-v] [-seed] [-nodht] <file.torrent | "magnet:?...">
         download it; re-run the same command to resume an interrupted download
-  mini-bittorrent seed     [-port N] [-v] <file.torrent> <path>
+  mini-bittorrent seed     [-port N] [-limit KiB/s] [-v] <file.torrent> <path>
         upload a finished download to other peers
   mini-bittorrent demo     [-v]
         run a local swarm and download from it (no internet needed)

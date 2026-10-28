@@ -37,6 +37,7 @@ func runDownload(args []string) error {
 	verbose := fs.Bool("v", false, "log per-peer events")
 	seedAfter := fs.Bool("seed", false, "keep seeding after the download finishes (Ctrl+C to stop)")
 	port := fs.Int("port", 6881, "port to seed on (with -seed)")
+	limit := fs.Int64("limit", 0, "upload limit in KiB/s while seeding (with -seed)")
 	noDHT := fs.Bool("nodht", false, "don't look for peers in the DHT")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -75,7 +76,7 @@ func runDownload(args []string) error {
 		return err
 	}
 	if *seedAfter {
-		return seedTorrent(tf, *outPath, *port, *verbose)
+		return seedTorrent(tf, *outPath, *port, *limit, *verbose)
 	}
 	return nil
 }
