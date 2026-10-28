@@ -66,16 +66,60 @@ func TestOpenFromDisk(t *testing.T) {
 	}
 }
 
-func TestParseRejectsMultiFile(t *testing.T) {
+func TestParseMultiFile(t *testing.T) {
+	raw, err := CreateMulti("http://t.test/announce", "album", 16, []FileData{
+		{Path: []string{"cd1", "01.flac"}, Data: []byte("0123456789")},
+		{Path: []string{"empty.txt"}, Data: nil},
+		{Path: []string{"cover.jpg"}, Data: []byte("abcdefghijklmnopqrstuv")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tf, err := Parse(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	if !tf.MultiFile || tf.Name != "album" || len(tf.Files) != 3 || tf.Length != 32 || len(tf.PieceHashes) != 2 {
+		t.Fatalf("got %+v", tf)
+	}
+	if tf.Files[0].Path[1] != "01.flac" || tf.Files[2].Offset != 10 || tf.Files[2].Length != 22 {
+		t.Errorf("bad file layout: %+v", tf.Files)
+	}
+}
+
+func TestParseRejectsUnsafePaths(t *testing.T) {
+	for _, path := range [][]string{{"..", "etc", "passwd"}, {"a/b"}, {""}, {"ok", ".."}} {
+		raw, _ := CreateMulti("http://t.test/", "root", 16, []FileData{{Path: path, Data: []byte("x")}})
+		if _, err := Parse(bytes.NewReader(raw)); err == nil {
+			t.Errorf("path %q: expected an error", path)
+		}
+	}
+	raw, _ := Create("http://t.test/", "../evil", 16, []byte("x"))
+	if _, err := Parse(bytes.NewReader(raw)); err == nil {
+		t.Error("expected an error for a name with a separator")
+	}
+}
+
+func TestTrackersFromAnnounceList(t *testing.T) {
 	raw, _ := bencode.Encode(map[string]interface{}{
-		"announce": "http://t.test/",
+		"announce": "http://a.test/announce",
+		"announce-list": []interface{}{
+			[]interface{}{"udp://b.test:80", "http://a.test/announce"},
+			[]interface{}{},
+			[]interface{}{"http://c.test/announce"},
+		},
 		"info": map[string]interface{}{
-			"name": "dir", "piece length": int64(16), "pieces": strings.Repeat("x", 20),
-			"files": []interface{}{},
+			"name": "f", "length": int64(1), "piece length": int64(16), "pieces": strings.Repeat("x", 20),
 		},
 	})
-	if _, err := Parse(bytes.NewReader(raw)); err == nil {
-		t.Fatal("expected an error for a multi-file torrent")
+	tf, err := Parse(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(tf.Trackers(), " ")
+	want := "udp://b.test:80 http://a.test/announce http://c.test/announce"
+	if got != want {
+		t.Errorf("Trackers() = %q, want %q", got, want)
 	}
 }
 

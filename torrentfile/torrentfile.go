@@ -6,18 +6,49 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"mini-bittorrent/bencode"
 )
 
+// File is one file inside the torrent, in the order its bytes appear in the piece stream.
+type File struct {
+	Path   []string // path components relative to the torrent's root
+	Length int64
+	Offset int64 // where this file starts in the concatenated byte stream
+}
+
 // TorrentFile holds the parsed, usable info from a .torrent file.
 type TorrentFile struct {
-	Announce    string     // tracker URL
-	InfoHash    [20]byte   // SHA-1 hash of the info dict (identifies the torrent)
-	PieceHashes [][20]byte // SHA-1 hash of each piece
-	PieceLength int64      // bytes per piece
-	Length      int64      // total file length in bytes
-	Name        string     // suggested file name
+	Announce     string     // primary tracker URL (may be empty if only AnnounceList is set)
+	AnnounceList [][]string // tracker tiers (BEP 12), may be empty
+	InfoHash     [20]byte   // SHA-1 hash of the info dict (identifies the torrent)
+	PieceHashes  [][20]byte // SHA-1 hash of each piece
+	PieceLength  int64      // bytes per piece
+	Length       int64      // total length of all files in bytes
+	Name         string     // file name (single-file) or root directory name (multi-file)
+	Files        []File     // always at least one entry
+	MultiFile    bool       // true when the torrent describes a directory
+}
+
+// Trackers returns every tracker URL to try, best first and without duplicates:
+// announce-list tiers in order, then the plain announce URL.
+func (t *TorrentFile) Trackers() []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(u string) {
+		if u != "" && !seen[u] {
+			seen[u] = true
+			out = append(out, u)
+		}
+	}
+	for _, tier := range t.AnnounceList {
+		for _, u := range tier {
+			add(u)
+		}
+	}
+	add(t.Announce)
+	return out
 }
 
 // Open reads and parses a .torrent file from disk.
@@ -30,7 +61,7 @@ func Open(path string) (*TorrentFile, error) {
 	return Parse(f)
 }
 
-// Parse reads a bencoded .torrent from r. Only single-file torrents are supported.
+// Parse reads a bencoded .torrent from r.
 func Parse(r io.Reader) (*TorrentFile, error) {
 	decoded, err := bencode.Decode(bufio.NewReader(r))
 	if err != nil {
@@ -42,53 +73,117 @@ func Parse(r io.Reader) (*TorrentFile, error) {
 		return nil, fmt.Errorf("top-level bencode value is not a dictionary")
 	}
 
-	announce, _ := dict["announce"].(string)
-	if announce == "" {
-		return nil, fmt.Errorf("missing announce URL (trackerless/DHT torrents are not supported)")
+	tf := &TorrentFile{}
+	tf.Announce, _ = dict["announce"].(string)
+	if tiers, ok := dict["announce-list"].([]interface{}); ok {
+		for _, tier := range tiers {
+			list, _ := tier.([]interface{})
+			var urls []string
+			for _, u := range list {
+				if s, ok := u.(string); ok && s != "" {
+					urls = append(urls, s)
+				}
+			}
+			if len(urls) > 0 {
+				tf.AnnounceList = append(tf.AnnounceList, urls)
+			}
+		}
+	}
+	if len(tf.Trackers()) == 0 {
+		return nil, fmt.Errorf("no tracker URL (trackerless/DHT torrents are not supported)")
 	}
 
 	info, ok := dict["info"].(map[string]interface{})
 	if !ok {
 		return nil, fmt.Errorf("missing or invalid info dict")
 	}
-	if _, multi := info["files"]; multi {
-		return nil, fmt.Errorf("multi-file torrents are not supported yet")
-	}
 
-	infoHash, err := hashInfoDict(info)
-	if err != nil {
+	if tf.InfoHash, err = hashInfoDict(info); err != nil {
 		return nil, err
 	}
 
-	pieceLength, _ := info["piece length"].(int64)
-	length, _ := info["length"].(int64)
-	name, _ := info["name"].(string)
-	if pieceLength <= 0 || length <= 0 {
-		return nil, fmt.Errorf("invalid piece length (%d) or file length (%d)", pieceLength, length)
+	tf.PieceLength, _ = info["piece length"].(int64)
+	tf.Name, _ = info["name"].(string)
+	if tf.PieceLength <= 0 {
+		return nil, fmt.Errorf("invalid piece length %d", tf.PieceLength)
+	}
+	if err := checkPathComponent(tf.Name); err != nil {
+		return nil, fmt.Errorf("unsafe torrent name: %w", err)
+	}
+
+	if files, multi := info["files"]; multi {
+		tf.MultiFile = true
+		if tf.Files, err = parseFiles(files); err != nil {
+			return nil, err
+		}
+	} else {
+		length, _ := info["length"].(int64)
+		tf.Files = []File{{Path: []string{tf.Name}, Length: length}}
+	}
+	for i := range tf.Files {
+		tf.Files[i].Offset = tf.Length
+		tf.Length += tf.Files[i].Length
+	}
+	if tf.Length <= 0 {
+		return nil, fmt.Errorf("torrent has no data (total length %d)", tf.Length)
 	}
 
 	piecesStr, ok := info["pieces"].(string)
 	if !ok {
 		return nil, fmt.Errorf("missing pieces string")
 	}
-	pieceHashes, err := splitPieceHashes(piecesStr)
-	if err != nil {
+	if tf.PieceHashes, err = splitPieceHashes(piecesStr); err != nil {
 		return nil, err
 	}
-
-	wantPieces := (length + pieceLength - 1) / pieceLength
-	if int64(len(pieceHashes)) != wantPieces {
-		return nil, fmt.Errorf("expected %d piece hashes for %d bytes, got %d", wantPieces, length, len(pieceHashes))
+	wantPieces := (tf.Length + tf.PieceLength - 1) / tf.PieceLength
+	if int64(len(tf.PieceHashes)) != wantPieces {
+		return nil, fmt.Errorf("expected %d piece hashes for %d bytes, got %d", wantPieces, tf.Length, len(tf.PieceHashes))
 	}
+	return tf, nil
+}
 
-	return &TorrentFile{
-		Announce:    announce,
-		InfoHash:    infoHash,
-		PieceHashes: pieceHashes,
-		PieceLength: pieceLength,
-		Length:      length,
-		Name:        name,
-	}, nil
+func parseFiles(v interface{}) ([]File, error) {
+	list, ok := v.([]interface{})
+	if !ok || len(list) == 0 {
+		return nil, fmt.Errorf("invalid or empty files list")
+	}
+	files := make([]File, 0, len(list))
+	for i, item := range list {
+		fd, ok := item.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("file %d is not a dictionary", i)
+		}
+		length, ok := fd["length"].(int64)
+		if !ok || length < 0 {
+			return nil, fmt.Errorf("file %d has an invalid length", i)
+		}
+		rawPath, ok := fd["path"].([]interface{})
+		if !ok || len(rawPath) == 0 {
+			return nil, fmt.Errorf("file %d has no path", i)
+		}
+		path := make([]string, len(rawPath))
+		for j, p := range rawPath {
+			s, _ := p.(string)
+			if err := checkPathComponent(s); err != nil {
+				return nil, fmt.Errorf("file %d has an unsafe path: %w", i, err)
+			}
+			path[j] = s
+		}
+		files = append(files, File{Path: path, Length: length})
+	}
+	return files, nil
+}
+
+// checkPathComponent rejects names that could write outside the download
+// directory (a malicious torrent could otherwise use "../" or absolute paths).
+func checkPathComponent(s string) error {
+	switch {
+	case s == "" || s == "." || s == "..":
+		return fmt.Errorf("invalid path component %q", s)
+	case strings.ContainsAny(s, "/\\\x00"):
+		return fmt.Errorf("path component %q contains a separator", s)
+	}
+	return nil
 }
 
 // hashInfoDict re-encodes the info dict and returns its SHA-1 hash.
@@ -118,9 +213,8 @@ func splitPieceHashes(pieces string) ([][20]byte, error) {
 	return hashes, nil
 }
 
-// Create builds the bencoded bytes of a single-file .torrent for data.
-// It is used by the tests and by the local demo seeder.
-func Create(announce, name string, pieceLength int64, data []byte) ([]byte, error) {
+// pieceString hashes data into the concatenated "pieces" string.
+func pieceString(pieceLength int64, data []byte) string {
 	var pieces []byte
 	for start := 0; start < len(data); start += int(pieceLength) {
 		end := start + int(pieceLength)
@@ -130,13 +224,48 @@ func Create(announce, name string, pieceLength int64, data []byte) ([]byte, erro
 		h := sha1.Sum(data[start:end])
 		pieces = append(pieces, h[:]...)
 	}
+	return string(pieces)
+}
+
+// Create builds the bencoded bytes of a single-file .torrent for data.
+// It is used by the tests and by the local demo swarm.
+func Create(announce, name string, pieceLength int64, data []byte) ([]byte, error) {
 	return bencode.Encode(map[string]interface{}{
 		"announce": announce,
 		"info": map[string]interface{}{
 			"name":         name,
 			"length":       int64(len(data)),
 			"piece length": pieceLength,
-			"pieces":       string(pieces),
+			"pieces":       pieceString(pieceLength, data),
+		},
+	})
+}
+
+// FileData is one file passed to CreateMulti.
+type FileData struct {
+	Path []string
+	Data []byte
+}
+
+// CreateMulti builds a multi-file .torrent whose root directory is name.
+func CreateMulti(announce, name string, pieceLength int64, files []FileData) ([]byte, error) {
+	var all []byte
+	list := make([]interface{}, len(files))
+	for i, f := range files {
+		path := make([]interface{}, len(f.Path))
+		for j, p := range f.Path {
+			path[j] = p
+		}
+		list[i] = map[string]interface{}{"length": int64(len(f.Data)), "path": path}
+		all = append(all, f.Data...)
+	}
+	return bencode.Encode(map[string]interface{}{
+		"announce": announce,
+		"info": map[string]interface{}{
+			"name":         name,
+			"files":        list,
+			"piece length": pieceLength,
+			"pieces":       pieceString(pieceLength, all),
 		},
 	})
 }
