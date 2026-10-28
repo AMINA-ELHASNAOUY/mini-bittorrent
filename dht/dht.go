@@ -8,8 +8,9 @@
 // nodes and repeatedly ask the closest nodes we know about for nodes even
 // closer to the hash, until someone answers with peers.
 //
-// This is a read-only client (BEP 43): it looks things up but doesn't store
-// data for others.
+// New gives a read-only client (BEP 43) that only looks things up. NewNode
+// gives a full node (node.go): it also answers other nodes' queries, keeps a
+// routing table, stores peers that announce themselves, and can announce us.
 package dht
 
 import (
@@ -52,10 +53,14 @@ type Client struct {
 	nextTx  uint16
 	pending map[string]chan map[string]interface{}
 	closed  chan struct{}
+
+	server *server // nil for a read-only client
 }
 
-// New opens a UDP socket (addr like ":0") and starts reading replies.
-func New(addr string) (*Client, error) {
+// New opens a UDP socket (addr like ":0") for a read-only client.
+func New(addr string) (*Client, error) { return open(addr, false) }
+
+func open(addr string, full bool) (*Client, error) {
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return nil, err
@@ -68,6 +73,12 @@ func New(addr string) (*Client, error) {
 	if _, err := rand.Read(c.id[:]); err != nil {
 		conn.Close()
 		return nil, err
+	}
+	if full {
+		if c.server, err = newServer(c.id); err != nil {
+			conn.Close()
+			return nil, err
+		}
 	}
 	go c.readLoop()
 	return c, nil
@@ -86,7 +97,7 @@ func (c *Client) Close() error {
 func (c *Client) readLoop() {
 	buf := make([]byte, 65536)
 	for {
-		n, _, err := c.conn.ReadFromUDP(buf)
+		n, from, err := c.conn.ReadFromUDP(buf)
 		if err != nil {
 			return
 		}
@@ -99,6 +110,12 @@ func (c *Client) readLoop() {
 			continue
 		}
 		tx, _ := msg["t"].(string)
+		if msg["y"] == "q" {
+			if c.server != nil {
+				c.handleQuery(msg, from)
+			}
+			continue
+		}
 		c.mu.Lock()
 		ch := c.pending[tx]
 		delete(c.pending, tx)
@@ -124,9 +141,11 @@ func (c *Client) query(ctx context.Context, addr *net.UDPAddr, method string, ar
 	}()
 
 	args["id"] = string(c.id[:])
-	pkt, err := bencode.Encode(map[string]interface{}{
-		"t": tx, "y": "q", "q": method, "a": args, "ro": int64(1),
-	})
+	q := map[string]interface{}{"t": tx, "y": "q", "q": method, "a": args}
+	if c.server == nil {
+		q["ro"] = int64(1) // read-only: don't add us to routing tables
+	}
+	pkt, err := bencode.Encode(q)
 	if err != nil {
 		return nil, err
 	}
@@ -160,16 +179,32 @@ func (c *Client) query(ctx context.Context, addr *net.UDPAddr, method string, ar
 
 // node is a DHT node we know about. Bootstrap nodes start with an unknown ID.
 type node struct {
-	id      [20]byte
-	knownID bool
-	addr    *net.UDPAddr
-	queried bool
+	id        [20]byte
+	knownID   bool
+	addr      *net.UDPAddr
+	queried   bool
+	responded bool
+	token     string // from get_peers, needed to announce to this node
 }
 
 // GetPeers walks the DHT towards infoHash and returns up to `want` peer
 // addresses ("ip:port"). It stops early once it has enough peers, when no
 // closer nodes turn up, or when ctx expires — whichever comes first.
 func (c *Client) GetPeers(ctx context.Context, infoHash [20]byte, bootstrap []string, want int) ([]string, error) {
+	peers, _, err := c.lookup(ctx, infoHash, bootstrap, want)
+	if err != nil {
+		return nil, err
+	}
+	if len(peers) == 0 {
+		return nil, errors.New("DHT lookup found no peers")
+	}
+	return peers, nil
+}
+
+// lookup runs an iterative get_peers search. Besides peers it returns the
+// nodes that answered, closest first, with the tokens they handed out (which
+// announce_peer needs).
+func (c *Client) lookup(ctx context.Context, infoHash [20]byte, bootstrap []string, want int) ([]string, []*node, error) {
 	nodes := map[string]*node{}
 	for _, b := range bootstrap {
 		addr, err := net.ResolveUDPAddr("udp4", b)
@@ -178,8 +213,13 @@ func (c *Client) GetPeers(ctx context.Context, infoHash [20]byte, bootstrap []st
 		}
 		nodes[addr.String()] = &node{addr: addr}
 	}
+	if c.server != nil {
+		for _, n := range c.server.table.closest(infoHash, kClosest) {
+			nodes[n.addr.String()] = &node{id: n.id, knownID: true, addr: n.addr}
+		}
+	}
 	if len(nodes) == 0 {
-		return nil, errors.New("could not resolve any bootstrap node")
+		return nil, nil, errors.New("could not resolve any bootstrap node")
 	}
 
 	seen := map[string]bool{}
@@ -207,6 +247,11 @@ func (c *Client) GetPeers(ctx context.Context, infoHash [20]byte, bootstrap []st
 				if id, ok := r["id"].(string); ok && len(id) == 20 {
 					copy(n.id[:], id)
 					n.knownID = true
+					n.responded = true
+					n.token, _ = r["token"].(string)
+					if c.server != nil {
+						c.server.table.add(n.id, n.addr)
+					}
 				}
 				for _, p := range newPeers {
 					if !seen[p] {
@@ -215,7 +260,7 @@ func (c *Client) GetPeers(ctx context.Context, infoHash [20]byte, bootstrap []st
 					}
 				}
 				for _, nn := range newNodes {
-					if _, ok := nodes[nn.addr.String()]; !ok {
+					if _, ok := nodes[nn.addr.String()]; !ok && nn.id != c.id {
 						nodes[nn.addr.String()] = nn
 					}
 				}
@@ -226,13 +271,21 @@ func (c *Client) GetPeers(ctx context.Context, infoHash [20]byte, bootstrap []st
 			break
 		}
 	}
-	if len(peers) == 0 {
-		return nil, errors.New("DHT lookup found no peers")
-	}
 	if len(peers) > want {
 		peers = peers[:want]
 	}
-	return peers, nil
+
+	var responded []*node
+	for _, n := range nodes {
+		if n.responded {
+			responded = append(responded, n)
+		}
+	}
+	sort.Slice(responded, func(i, j int) bool {
+		di, dj := xor(responded[i].id, infoHash), xor(responded[j].id, infoHash)
+		return bytes.Compare(di[:], dj[:]) < 0
+	})
+	return peers, responded, nil
 }
 
 // closestUnqueried returns up to alpha not-yet-queried nodes from the

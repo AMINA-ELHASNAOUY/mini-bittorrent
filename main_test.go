@@ -1,13 +1,18 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
+	"crypto/sha1"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"mini-bittorrent/bencode"
+	"mini-bittorrent/dht"
 	"mini-bittorrent/internal/localswarm"
 	"mini-bittorrent/magnet"
 	"mini-bittorrent/seed"
@@ -131,4 +136,89 @@ func TestTorrentFallsBackToDHTWhenTrackersFail(t *testing.T) {
 	if !bytes.Equal(got, data) {
 		t.Fatal("downloaded file differs")
 	}
+}
+
+func TestSeedTrackerlessThenDownloadByMagnetOverDHT(t *testing.T) {
+	inTempDir(t)
+	// A small local DHT: 6 full nodes bootstrapped off the first one.
+	var nodes []*dht.Client
+	for i := 0; i < 6; i++ {
+		n, err := dht.NewNode("127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer n.Close()
+		nodes = append(nodes, n)
+	}
+	boot := []string{nodes[0].Addr().String()}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	for _, n := range nodes[1:] {
+		n.Bootstrap(ctx, boot)
+	}
+	old := dhtBootstrap
+	dhtBootstrap = boot
+	defer func() { dhtBootstrap = old }()
+
+	// A torrent with no trackers at all, seeded with the real `seed` code path.
+	data := randomBytes(300_000)
+	os.WriteFile("song.flac", data, 0o644)
+	info, _ := bencode.Encode(map[string]interface{}{
+		"name": "song.flac", "length": int64(len(data)), "piece length": int64(65536),
+		"pieces": piecesOf(data, 65536),
+	})
+	raw, _ := bencode.Encode(map[string]interface{}{"info": decode(t, info)})
+	tf, err := torrentfile.Parse(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	done := make(chan error, 1)
+	go func() { done <- seedUntil(tf, "song.flac", 0, 0, false, stop) }()
+	defer func() { close(stop); <-done }()
+
+	// Wait until the seeder's DHT announce has landed somewhere.
+	reader, _ := dht.New("127.0.0.1:0")
+	defer reader.Close()
+	for {
+		if peers, _ := reader.GetPeers(ctx, tf.InfoHash, boot, 1); len(peers) > 0 {
+			break
+		}
+		if ctx.Err() != nil {
+			t.Fatal("seeder never appeared in the DHT")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	os.Mkdir("dl", 0o755)
+	link := (&magnet.Link{InfoHash: tf.InfoHash}).String()
+	if err := runDownload([]string{"-o", "dl/song.flac", link}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile("dl/song.flac")
+	if !bytes.Equal(got, data) {
+		t.Fatal("downloaded file differs")
+	}
+}
+
+func piecesOf(data []byte, n int) string {
+	var out []byte
+	for off := 0; off < len(data); off += n {
+		end := off + n
+		if end > len(data) {
+			end = len(data)
+		}
+		h := sha1.Sum(data[off:end])
+		out = append(out, h[:]...)
+	}
+	return string(out)
+}
+
+func decode(t *testing.T, b []byte) interface{} {
+	t.Helper()
+	v, err := bencode.Decode(bufio.NewReader(bytes.NewReader(b)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
 }

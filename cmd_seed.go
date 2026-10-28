@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"os/signal"
 	"time"
 
+	"mini-bittorrent/dht"
 	"mini-bittorrent/seed"
 	"mini-bittorrent/storage"
 	"mini-bittorrent/torrentfile"
@@ -36,6 +38,11 @@ func runSeed(args []string) error {
 // seedTorrent verifies the data at path, then serves it to peers and keeps
 // the trackers informed until Ctrl+C.
 func seedTorrent(tf *torrentfile.TorrentFile, path string, port int, limitKiB int64, verbose bool) error {
+	return seedUntil(tf, path, port, limitKiB, verbose, nil)
+}
+
+// seedUntil is seedTorrent that also stops when stop is closed (used by tests).
+func seedUntil(tf *torrentfile.TorrentFile, path string, port int, limitKiB int64, verbose bool, stop <-chan struct{}) error {
 	st, err := storage.OpenExisting(path, tf)
 	if err != nil {
 		return err
@@ -74,15 +81,39 @@ func seedTorrent(tf *torrentfile.TorrentFile, path string, port int, limitKiB in
 		fmt.Printf("→ upload limited to %d KiB/s, uploading to %d peers at a time\n", limitKiB, 4)
 	}
 
+	// Run a full DHT node on the same port number (UDP), so peers can find us
+	// even without a tracker, and so we help route other people's lookups.
+	node, err := dht.NewNode(fmt.Sprintf(":%d", srv.Port()))
+	if err != nil {
+		fmt.Printf("  DHT unavailable (%v); trackers only\n", err)
+	} else {
+		defer node.Close()
+	}
+
 	announce := func() {
-		left := tf.Length * int64(len(tf.PieceHashes)-srv.Have()) / int64(len(tf.PieceHashes))
-		_, errs := tracker.AnnounceAll(tf.Trackers(), tracker.Request{
-			InfoHash: tf.InfoHash, PeerID: peerID, Port: srv.Port(), Left: left,
-		}, 3*time.Second)
-		if verbose {
-			for _, e := range errs {
-				fmt.Println("  tracker failed:", e)
+		if trackers := tf.Trackers(); len(trackers) > 0 {
+			left := tf.Length * int64(len(tf.PieceHashes)-srv.Have()) / int64(len(tf.PieceHashes))
+			_, errs := tracker.AnnounceAll(trackers, tracker.Request{
+				InfoHash: tf.InfoHash, PeerID: peerID, Port: srv.Port(), Left: left,
+			}, 3*time.Second)
+			if verbose {
+				for _, e := range errs {
+					fmt.Println("  tracker failed:", e)
+				}
 			}
+		}
+		if node != nil {
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), dhtTimeout)
+				defer cancel()
+				n, err := node.Announce(ctx, tf.InfoHash, int(srv.Port()), dhtBootstrap)
+				switch {
+				case err != nil && verbose:
+					fmt.Print(clearLineSeq, "  DHT announce failed: ", err, "\n")
+				case err == nil:
+					fmt.Printf("%s→ announced to %d DHT nodes\n", clearLineSeq, n)
+				}
+			}()
 		}
 	}
 	announce()
@@ -92,7 +123,7 @@ func seedTorrent(tf *torrentfile.TorrentFile, path string, port int, limitKiB in
 	defer signal.Stop(interrupt)
 	status := time.NewTicker(time.Second)
 	defer status.Stop()
-	reannounce := time.NewTicker(30 * time.Minute)
+	reannounce := time.NewTicker(15 * time.Minute) // DHT entries expire after 30 min
 	defer reannounce.Stop()
 	for {
 		select {
@@ -102,6 +133,8 @@ func seedTorrent(tf *torrentfile.TorrentFile, path string, port int, limitKiB in
 			announce()
 		case <-interrupt:
 			fmt.Printf("\n✓ stopped seeding (%s uploaded)\n", humanBytes(srv.Uploaded()))
+			return nil
+		case <-stop:
 			return nil
 		}
 	}

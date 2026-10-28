@@ -7,11 +7,14 @@ import (
 	"strings"
 )
 
+// clearLineSeq moves to the start of the line and clears it (over the status line).
+const clearLineSeq = "\r\033[K"
+
 // clearLine erases the progress bar before a log line is printed over it.
 type clearLine struct{ w io.Writer }
 
 func (c clearLine) Write(p []byte) (int, error) {
-	if _, err := io.WriteString(c.w, "\r\033[K"); err != nil {
+	if _, err := io.WriteString(c.w, clearLineSeq); err != nil {
 		return 0, err
 	}
 	return c.w.Write(p)
