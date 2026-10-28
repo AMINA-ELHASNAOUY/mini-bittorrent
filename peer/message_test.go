@@ -52,3 +52,33 @@ func TestSerializeNilMessage(t *testing.T) {
 		t.Fatalf("expected length 4, got %d", len(buf))
 	}
 }
+
+func TestRequestAndHave(t *testing.T) {
+	req := FormatRequest(4, 16384, 16384)
+	if req.ID != MsgRequest || !bytes.Equal(req.Payload, []byte{0, 0, 0, 4, 0, 0, 0x40, 0, 0, 0, 0x40, 0}) {
+		t.Errorf("bad request payload %v", req.Payload)
+	}
+	idx, err := ParseHave(FormatHave(300))
+	if err != nil || idx != 300 {
+		t.Errorf("ParseHave = %d, %v", idx, err)
+	}
+	if _, err := ParseHave(&Message{ID: MsgHave, Payload: []byte{1}}); err == nil {
+		t.Error("expected error for short HAVE")
+	}
+}
+
+func TestParsePiece(t *testing.T) {
+	buf := make([]byte, 10)
+	m := &Message{ID: MsgPiece, Payload: []byte{0, 0, 0, 2, 0, 0, 0, 3, 'a', 'b', 'c'}}
+	n, err := ParsePiece(2, buf, m)
+	if err != nil || n != 3 || string(buf[3:6]) != "abc" {
+		t.Fatalf("n=%d err=%v buf=%q", n, err, buf)
+	}
+	if _, err := ParsePiece(1, buf, m); err == nil {
+		t.Error("expected error for wrong piece index")
+	}
+	tooFar := &Message{ID: MsgPiece, Payload: []byte{0, 0, 0, 2, 0, 0, 0, 9, 'a', 'b'}}
+	if _, err := ParsePiece(2, buf, tooFar); err == nil {
+		t.Error("expected error for block past end of piece")
+	}
+}
