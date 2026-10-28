@@ -178,8 +178,18 @@ func parseResponse(r *bufio.Reader) (*Response, error) {
 			}
 			res.Peers = append(res.Peers, Peer{IP: ip, Port: uint16(port)})
 		}
+	case nil:
 	default:
-		return nil, fmt.Errorf("tracker response has no peers")
+		return nil, fmt.Errorf("tracker response has a malformed peer list")
+	}
+	// IPv6 peers come separately in compact form, 18 bytes each (BEP 7).
+	if peers6, ok := dict["peers6"].(string); ok {
+		for off := 0; off+18 <= len(peers6); off += 18 {
+			res.Peers = append(res.Peers, Peer{
+				IP:   net.IP(append([]byte(nil), peers6[off:off+16]...)),
+				Port: binary.BigEndian.Uint16([]byte(peers6[off+16 : off+18])),
+			})
+		}
 	}
 	return res, nil
 }

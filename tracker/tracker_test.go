@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 )
 
@@ -74,5 +75,20 @@ func TestAnnounceDictPeersAndFailure(t *testing.T) {
 	}
 	if _, err := Announce(srv.Client(), Request{Announce: srv.URL, Left: 0}); err == nil {
 		t.Fatal("expected tracker failure error")
+	}
+}
+
+func TestAnnounceIPv6Peers(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		v6 := "\x20\x01\x0d\xb8" + strings.Repeat("\x00", 11) + "\x01" + "\x1a\xe1"
+		w.Write([]byte("d8:intervali60e5:peers0:6:peers618:" + v6 + "e"))
+	}))
+	defer srv.Close()
+	res, err := Announce(srv.Client(), Request{Announce: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Peers) != 1 || res.Peers[0].String() != "[2001:db8::1]:6881" {
+		t.Fatalf("got %v", res.Peers)
 	}
 }
