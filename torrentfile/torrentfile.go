@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/sha1"
 	"fmt"
+	"io"
 	"os"
 
 	"mini-bittorrent/bencode"
@@ -26,9 +27,12 @@ func Open(path string) (*TorrentFile, error) {
 		return nil, err
 	}
 	defer f.Close()
+	return Parse(f)
+}
 
-	r := bufio.NewReader(f)
-	decoded, err := bencode.Decode(r)
+// Parse reads a bencoded .torrent from r. Only single-file torrents are supported.
+func Parse(r io.Reader) (*TorrentFile, error) {
+	decoded, err := bencode.Decode(bufio.NewReader(r))
 	if err != nil {
 		return nil, fmt.Errorf("decode error: %w", err)
 	}
@@ -39,10 +43,16 @@ func Open(path string) (*TorrentFile, error) {
 	}
 
 	announce, _ := dict["announce"].(string)
+	if announce == "" {
+		return nil, fmt.Errorf("missing announce URL (trackerless/DHT torrents are not supported)")
+	}
 
 	info, ok := dict["info"].(map[string]interface{})
 	if !ok {
 		return nil, fmt.Errorf("missing or invalid info dict")
+	}
+	if _, multi := info["files"]; multi {
+		return nil, fmt.Errorf("multi-file torrents are not supported yet")
 	}
 
 	infoHash, err := hashInfoDict(info)
@@ -53,6 +63,9 @@ func Open(path string) (*TorrentFile, error) {
 	pieceLength, _ := info["piece length"].(int64)
 	length, _ := info["length"].(int64)
 	name, _ := info["name"].(string)
+	if pieceLength <= 0 || length <= 0 {
+		return nil, fmt.Errorf("invalid piece length (%d) or file length (%d)", pieceLength, length)
+	}
 
 	piecesStr, ok := info["pieces"].(string)
 	if !ok {
@@ -61,6 +74,11 @@ func Open(path string) (*TorrentFile, error) {
 	pieceHashes, err := splitPieceHashes(piecesStr)
 	if err != nil {
 		return nil, err
+	}
+
+	wantPieces := (length + pieceLength - 1) / pieceLength
+	if int64(len(pieceHashes)) != wantPieces {
+		return nil, fmt.Errorf("expected %d piece hashes for %d bytes, got %d", wantPieces, length, len(pieceHashes))
 	}
 
 	return &TorrentFile{
@@ -75,6 +93,7 @@ func Open(path string) (*TorrentFile, error) {
 
 // hashInfoDict re-encodes the info dict and returns its SHA-1 hash.
 // The info hash is how peers/trackers uniquely identify a torrent.
+// Bencoding is canonical (sorted keys), so re-encoding gives back the original bytes.
 func hashInfoDict(info map[string]interface{}) ([20]byte, error) {
 	encoded, err := bencode.Encode(info)
 	if err != nil {
@@ -97,4 +116,27 @@ func splitPieceHashes(pieces string) ([][20]byte, error) {
 		copy(hashes[i][:], buf[i*hashLen:(i+1)*hashLen])
 	}
 	return hashes, nil
+}
+
+// Create builds the bencoded bytes of a single-file .torrent for data.
+// It is used by the tests and by the local demo seeder.
+func Create(announce, name string, pieceLength int64, data []byte) ([]byte, error) {
+	var pieces []byte
+	for start := 0; start < len(data); start += int(pieceLength) {
+		end := start + int(pieceLength)
+		if end > len(data) {
+			end = len(data)
+		}
+		h := sha1.Sum(data[start:end])
+		pieces = append(pieces, h[:]...)
+	}
+	return bencode.Encode(map[string]interface{}{
+		"announce": announce,
+		"info": map[string]interface{}{
+			"name":         name,
+			"length":       int64(len(data)),
+			"piece length": pieceLength,
+			"pieces":       string(pieces),
+		},
+	})
 }
