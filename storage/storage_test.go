@@ -88,3 +88,36 @@ func TestSingleFileKeepsExistingData(t *testing.T) {
 		t.Errorf("got %q", got)
 	}
 }
+
+func TestOpenExistingNeverModifies(t *testing.T) {
+	raw, _ := torrentfile.Create("http://t.test/", "f.bin", 4, []byte("0123456789"))
+	tf, _ := torrentfile.Parse(bytes.NewReader(raw))
+	dir := t.TempDir()
+
+	if _, err := OpenExisting(filepath.Join(dir, "missing.bin"), tf); err == nil {
+		t.Error("expected an error for a missing file")
+	}
+	wrong := filepath.Join(dir, "wrong.bin")
+	os.WriteFile(wrong, []byte("0123456789EXTRA"), 0o644)
+	if _, err := OpenExisting(wrong, tf); err == nil {
+		t.Error("expected an error for a file of the wrong size")
+	}
+	if data, _ := os.ReadFile(wrong); string(data) != "0123456789EXTRA" {
+		t.Error("OpenExisting modified a file it rejected")
+	}
+
+	ok := filepath.Join(dir, "ok.bin")
+	os.WriteFile(ok, []byte("0123456789"), 0o444)
+	s, err := OpenExisting(ok, tf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 3)
+	s.ReadAt(buf, 7)
+	if string(buf) != "789" {
+		t.Errorf("ReadAt = %q", buf)
+	}
+	if err := s.Close(); err != nil {
+		t.Errorf("Close on read-only storage: %v", err)
+	}
+}

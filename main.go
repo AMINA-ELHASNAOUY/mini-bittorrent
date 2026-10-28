@@ -9,12 +9,14 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"mini-bittorrent/download"
 	"mini-bittorrent/internal/localswarm"
+	"mini-bittorrent/seed"
 	"mini-bittorrent/storage"
 	"mini-bittorrent/torrentfile"
 	"mini-bittorrent/tracker"
@@ -24,7 +26,10 @@ const usage = `mini-bittorrent: a BitTorrent client written from the protocol sp
 
 Usage:
   mini-bittorrent info     <file.torrent>                show what's inside a .torrent
-  mini-bittorrent download [-o path] [-v] <file.torrent> download it (re-run the same command to resume)
+  mini-bittorrent download [-o path] [-v] [-seed] <file.torrent>
+                                                        download it (re-run the same command to resume)
+  mini-bittorrent seed     [-port N] [-v] <file.torrent> <path>
+                                                        upload a finished download to other peers
   mini-bittorrent demo     [-v]                          run a local swarm and download from it (no internet needed)
 `
 
@@ -39,6 +44,8 @@ func main() {
 		err = runInfo(os.Args[2:])
 	case "download":
 		err = runDownload(os.Args[2:])
+	case "seed":
+		err = runSeed(os.Args[2:])
 	case "demo":
 		err = runDemo(os.Args[2:])
 	case "-h", "--help", "help":
@@ -87,11 +94,13 @@ func runDownload(args []string) error {
 	fs := flag.NewFlagSet("download", flag.ContinueOnError)
 	outPath := fs.String("o", "", "output file (default: the name inside the torrent)")
 	verbose := fs.Bool("v", false, "log per-peer events")
+	seedAfter := fs.Bool("seed", false, "keep seeding after the download finishes (Ctrl+C to stop)")
+	port := fs.Int("port", 6881, "port to seed on (with -seed)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return errors.New("usage: mini-bittorrent download [-o path] [-v] <file.torrent>")
+		return errors.New("usage: mini-bittorrent download [-o path] [-v] [-seed] <file.torrent>")
 	}
 	tf, err := torrentfile.Open(fs.Arg(0))
 	if err != nil {
@@ -100,7 +109,100 @@ func runDownload(args []string) error {
 	if *outPath == "" {
 		*outPath = filepath.Base(tf.Name)
 	}
-	return fetch(tf, *outPath, *verbose)
+	if err := fetch(tf, *outPath, *verbose); err != nil {
+		return err
+	}
+	if *seedAfter {
+		return seedTorrent(tf, *outPath, *port, *verbose)
+	}
+	return nil
+}
+
+func runSeed(args []string) error {
+	fs := flag.NewFlagSet("seed", flag.ContinueOnError)
+	port := fs.Int("port", 6881, "TCP port to accept peers on")
+	verbose := fs.Bool("v", false, "log per-peer events")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 2 {
+		return errors.New("usage: mini-bittorrent seed [-port N] [-v] <file.torrent> <path to the downloaded file or folder>")
+	}
+	tf, err := torrentfile.Open(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	return seedTorrent(tf, fs.Arg(1), *port, *verbose)
+}
+
+// seedTorrent verifies the data at path, then serves it to peers and keeps
+// the trackers informed until Ctrl+C.
+func seedTorrent(tf *torrentfile.TorrentFile, path string, port int, verbose bool) error {
+	st, err := storage.OpenExisting(path, tf)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	peerID, err := newPeerID()
+	if err != nil {
+		return err
+	}
+	srv := &seed.Server{
+		InfoHash: tf.InfoHash, PeerID: peerID, PieceHashes: tf.PieceHashes,
+		PieceLength: tf.PieceLength, Length: tf.Length, Data: st,
+	}
+	if verbose {
+		srv.Logger = log.New(clearLine{os.Stdout}, "  ", log.Ltime)
+	}
+	fmt.Printf("→ checking %s…\n", path)
+	if err := srv.Verify(); err != nil {
+		return err
+	}
+	if srv.Have() == 0 {
+		return fmt.Errorf("%s doesn't match the torrent (0 of %d pieces valid)", path, len(tf.PieceHashes))
+	}
+	if err := srv.Listen(fmt.Sprintf(":%d", port)); err != nil {
+		fmt.Printf("  port %d unavailable (%v), using a random port\n", port, err)
+		if err := srv.Listen(":0"); err != nil {
+			return err
+		}
+	}
+	defer srv.Close()
+	fmt.Printf("→ seeding %d/%d pieces on port %d (peers behind your router can only reach you if this port is forwarded)\n",
+		srv.Have(), len(tf.PieceHashes), srv.Port())
+
+	announce := func() {
+		left := tf.Length * int64(len(tf.PieceHashes)-srv.Have()) / int64(len(tf.PieceHashes))
+		_, errs := tracker.AnnounceAll(tf.Trackers(), tracker.Request{
+			InfoHash: tf.InfoHash, PeerID: peerID, Port: srv.Port(), Left: left,
+		}, 3*time.Second)
+		if verbose {
+			for _, e := range errs {
+				fmt.Println("  tracker failed:", e)
+			}
+		}
+	}
+	announce()
+
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt)
+	defer signal.Stop(interrupt)
+	status := time.NewTicker(time.Second)
+	defer status.Stop()
+	reannounce := time.NewTicker(30 * time.Minute)
+	defer reannounce.Stop()
+	for {
+		select {
+		case <-status.C:
+			fmt.Printf("\r  ↑ %s uploaded · %d peers connected · Ctrl+C to stop ", humanBytes(srv.Uploaded()), srv.Peers())
+		case <-reannounce.C:
+			announce()
+		case <-interrupt:
+			fmt.Printf("\n✓ stopped seeding (%s uploaded)\n", humanBytes(srv.Uploaded()))
+			return nil
+		}
+	}
 }
 
 // fetch asks the trackers for peers, downloads every missing piece and

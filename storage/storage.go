@@ -22,8 +22,9 @@ type entry struct {
 
 // Storage implements io.WriterAt and io.ReaderAt over a set of files.
 type Storage struct {
-	entries []entry
-	length  int64
+	entries  []entry
+	length   int64
+	readOnly bool
 }
 
 // Open creates (or reopens, for resuming) every file of the torrent under
@@ -109,8 +110,10 @@ func (s *Storage) ReadAt(p []byte, off int64) (int, error) {
 func (s *Storage) Close() error {
 	var errs []error
 	for _, e := range s.entries {
-		if err := e.file.Sync(); err != nil {
-			errs = append(errs, err)
+		if !s.readOnly {
+			if err := e.file.Sync(); err != nil {
+				errs = append(errs, err)
+			}
 		}
 		if err := e.file.Close(); err != nil {
 			errs = append(errs, err)
@@ -125,4 +128,33 @@ func min64(a, b int64) int64 {
 		return a
 	}
 	return b
+}
+
+// OpenExisting opens already-downloaded files for reading (seeding) without
+// creating, truncating or modifying anything. Every file must exist with the
+// exact size the torrent expects.
+func OpenExisting(root string, tf *torrentfile.TorrentFile) (*Storage, error) {
+	s := &Storage{length: tf.Length, readOnly: true}
+	for _, f := range tf.Files {
+		path := root
+		if tf.MultiFile {
+			path = filepath.Join(append([]string{root}, f.Path...)...)
+		}
+		fh, err := os.Open(path)
+		if err != nil {
+			s.Close()
+			return nil, err
+		}
+		st, err := fh.Stat()
+		if err != nil || st.Size() != f.Length {
+			fh.Close()
+			s.Close()
+			if err == nil {
+				err = fmt.Errorf("%s is %d bytes, the torrent expects %d", path, st.Size(), f.Length)
+			}
+			return nil, err
+		}
+		s.entries = append(s.entries, entry{file: fh, offset: f.Offset, length: f.Length})
+	}
+	return s, nil
 }

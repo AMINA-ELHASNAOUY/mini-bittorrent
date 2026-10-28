@@ -118,18 +118,15 @@ func (t *Torrent) Download(out io.WriterAt, onProgress func(Progress)) error {
 	var stalledSince time.Time
 	done := numPieces - pk.remainingCount()
 
-	for !pk.finished() {
+	// Workers mark pieces complete in the picker as soon as they verify them,
+	// so no other peer is sent after a piece that is already on its way here.
+	for done < numPieces {
 		select {
 		case res := <-results:
-			if pk.isDone(res.index) { // endgame duplicate: someone else was faster
-				pk.release(res.index)
-				continue
-			}
 			begin, _ := t.pieceBounds(res.index)
 			if _, err := out.WriteAt(res.buf, begin); err != nil {
 				return fmt.Errorf("writing piece %d: %w", res.index, err)
 			}
-			pk.complete(res.index)
 			done++
 			if onProgress != nil {
 				mu.Lock()
@@ -213,6 +210,9 @@ func (t *Torrent) runWorker(addr string, pk *picker, results chan<- *pieceResult
 			continue
 		}
 
+		if !pk.complete(index) {
+			continue // endgame: another peer delivered this piece first
+		}
 		c.SendHave(index)
 		select {
 		case results <- &pieceResult{index: index, buf: buf}:

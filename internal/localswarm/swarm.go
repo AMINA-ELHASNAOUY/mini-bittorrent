@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"mini-bittorrent/bencode"
@@ -19,6 +20,9 @@ type Swarm struct {
 
 	tracker *http.Server
 	ln      net.Listener
+
+	mu        sync.Mutex
+	announced []string // "ip:port" of clients that announced themselves
 }
 
 // SeederSpec configures one seeder in the swarm.
@@ -83,12 +87,37 @@ func start(data []byte, pieceLength int, specs []SeederSpec, makeTorrent func(an
 			w.Write(b)
 			return
 		}
-		var compact []byte
+		// Like a real tracker: remember who announced, hand out everyone else.
+		host, _, _ := net.SplitHostPort(r.RemoteAddr)
+		self := net.JoinHostPort(host, r.URL.Query().Get("port"))
+		var addrs []string
 		for _, s := range sw.Seeders {
-			host, portStr, _ := net.SplitHostPort(s.Addr())
+			addrs = append(addrs, s.Addr())
+		}
+		sw.mu.Lock()
+		known := false
+		for _, a := range sw.announced {
+			known = known || a == self
+		}
+		if !known {
+			sw.announced = append(sw.announced, self)
+		}
+		addrs = append(addrs, sw.announced...)
+		sw.mu.Unlock()
+
+		var compact []byte
+		for _, a := range addrs {
+			if a == self {
+				continue
+			}
+			h, portStr, _ := net.SplitHostPort(a)
 			port, _ := strconv.Atoi(portStr)
+			ip := net.ParseIP(h).To4()
+			if ip == nil || port == 0 {
+				continue
+			}
 			entry := make([]byte, 6)
-			copy(entry, net.ParseIP(host).To4())
+			copy(entry, ip)
 			binary.BigEndian.PutUint16(entry[4:], uint16(port))
 			compact = append(compact, entry...)
 		}
