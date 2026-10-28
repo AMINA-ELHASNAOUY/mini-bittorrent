@@ -88,6 +88,10 @@ func (t *Torrent) Download(out io.WriterAt, onProgress func(Progress)) error {
 		stallTimeout = 30 * time.Second
 	}
 
+	// Count pieces already on disk before any worker starts: workers mark
+	// pieces complete in the picker before their results reach this loop.
+	done := numPieces - pk.remainingCount()
+
 	var (
 		wg     sync.WaitGroup
 		mu     sync.Mutex
@@ -116,7 +120,6 @@ func (t *Torrent) Download(out io.WriterAt, onProgress func(Progress)) error {
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	var stalledSince time.Time
-	done := numPieces - pk.remainingCount()
 
 	// Workers mark pieces complete in the picker as soon as they verify them,
 	// so no other peer is sent after a piece that is already on its way here.
@@ -254,6 +257,12 @@ func handleStateMessage(c *peer.Client, pk *picker, msg *peer.Message) bool {
 		if idx, err := peer.ParseHave(msg); err == nil && !c.Bitfield.HasPiece(idx) {
 			c.Bitfield.SetPiece(idx)
 			pk.have(idx)
+		}
+	case peer.MsgBitfield: // some peers send it late; replace what we assumed
+		if len(msg.Payload) == len(c.Bitfield) {
+			pk.removePeer(c.Bitfield)
+			copy(c.Bitfield, msg.Payload)
+			pk.addPeer(c.Bitfield)
 		}
 	default:
 		return false
