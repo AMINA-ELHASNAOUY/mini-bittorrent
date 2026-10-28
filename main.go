@@ -15,6 +15,7 @@ import (
 
 	"mini-bittorrent/download"
 	"mini-bittorrent/internal/localswarm"
+	"mini-bittorrent/storage"
 	"mini-bittorrent/torrentfile"
 	"mini-bittorrent/tracker"
 )
@@ -23,7 +24,7 @@ const usage = `mini-bittorrent: a BitTorrent client written from the protocol sp
 
 Usage:
   mini-bittorrent info     <file.torrent>                show what's inside a .torrent
-  mini-bittorrent download [-o path] [-v] <file.torrent> download the file it describes
+  mini-bittorrent download [-o path] [-v] <file.torrent> download it (re-run the same command to resume)
   mini-bittorrent demo     [-v]                          run a local swarm and download from it (no internet needed)
 `
 
@@ -61,11 +62,24 @@ func runInfo(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Name:         %s\n", tf.Name)
-	fmt.Printf("Size:         %s (%d bytes)\n", humanBytes(tf.Length), tf.Length)
-	fmt.Printf("Pieces:       %d × %s\n", len(tf.PieceHashes), humanBytes(tf.PieceLength))
-	fmt.Printf("Tracker:      %s\n", tf.Announce)
-	fmt.Printf("Info hash:    %x\n", tf.InfoHash)
+	fmt.Printf("Name:       %s\n", tf.Name)
+	fmt.Printf("Size:       %s (%d bytes)\n", humanBytes(tf.Length), tf.Length)
+	fmt.Printf("Pieces:     %d × %s\n", len(tf.PieceHashes), humanBytes(tf.PieceLength))
+	fmt.Printf("Info hash:  %x\n", tf.InfoHash)
+	fmt.Println("Trackers:")
+	for _, u := range tf.Trackers() {
+		fmt.Println("  " + u)
+	}
+	if tf.MultiFile {
+		fmt.Printf("Files (%d):\n", len(tf.Files))
+		for i, f := range tf.Files {
+			if i == 20 {
+				fmt.Printf("  … and %d more\n", len(tf.Files)-20)
+				break
+			}
+			fmt.Printf("  %10s  %s\n", humanBytes(f.Length), filepath.Join(f.Path...))
+		}
+	}
 	return nil
 }
 
@@ -89,55 +103,83 @@ func runDownload(args []string) error {
 	return fetch(tf, *outPath, *verbose)
 }
 
-// fetch announces to the tracker, downloads every piece, and writes the file.
+// fetch asks the trackers for peers, downloads every missing piece and
+// writes the result to outPath (a file, or a directory for multi-file torrents).
+// Data goes to outPath+".part" first, so an interrupted run can be resumed.
 func fetch(tf *torrentfile.TorrentFile, outPath string, verbose bool) error {
+	if _, err := os.Stat(outPath); err == nil {
+		return fmt.Errorf("%s already exists", outPath)
+	}
 	peerID, err := newPeerID()
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("→ %s (%s, %d pieces)\n", tf.Name, humanBytes(tf.Length), len(tf.PieceHashes))
-	fmt.Printf("→ asking tracker %s for peers…\n", tf.Announce)
-	res, err := tracker.Announce(nil, tracker.Request{
-		Announce: tf.Announce, InfoHash: tf.InfoHash, PeerID: peerID, Port: 6881, Left: tf.Length,
-	})
+	kind := "file"
+	if tf.MultiFile {
+		kind = fmt.Sprintf("%d files", len(tf.Files))
+	}
+	fmt.Printf("→ %s (%s, %s, %d pieces)\n", tf.Name, kind, humanBytes(tf.Length), len(tf.PieceHashes))
+
+	partPath := outPath + ".part"
+	st, err := storage.Open(partPath, tf)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("→ tracker returned %d peers\n", len(res.Peers))
+	defer st.Close()
 
 	t := &download.Torrent{
 		PeerID: peerID, InfoHash: tf.InfoHash, PieceHashes: tf.PieceHashes,
 		PieceLength: tf.PieceLength, Length: tf.Length,
 	}
-	for _, p := range res.Peers {
-		t.Peers = append(t.Peers, p.String())
+	have, resumed, err := t.CheckPieces(st)
+	if err != nil {
+		return err
+	}
+	if resumed > 0 {
+		fmt.Printf("→ resuming: %d of %d pieces already on disk and verified\n", resumed, len(tf.PieceHashes))
+	}
+	t.Completed = have
+
+	if resumed < len(tf.PieceHashes) {
+		trackers := tf.Trackers()
+		fmt.Printf("→ asking %d tracker(s) for peers…\n", len(trackers))
+		peers, errs := tracker.AnnounceAll(trackers, tracker.Request{
+			InfoHash: tf.InfoHash, PeerID: peerID, Port: 6881, Left: tf.Length,
+		}, 3*time.Second)
+		if verbose {
+			for _, e := range errs {
+				fmt.Println("  tracker failed:", e)
+			}
+		}
+		if len(peers) == 0 {
+			if len(errs) > 0 {
+				return fmt.Errorf("no tracker returned peers (first error: %v)", errs[0])
+			}
+			return errors.New("trackers returned no peers")
+		}
+		fmt.Printf("→ %d peers from %d tracker(s)\n", len(peers), len(trackers)-len(errs))
+		for _, p := range peers {
+			t.Peers = append(t.Peers, p.String())
+		}
 	}
 	if verbose {
 		t.Logger = log.New(clearLine{os.Stdout}, "  ", log.Ltime)
 	}
 
-	// Write into a .part file and only rename it once every piece is verified.
-	partPath := outPath + ".part"
-	f, err := os.Create(partPath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
 	start := time.Now()
-	err = t.Download(f, func(p download.Progress) {
+	err = t.Download(st, func(p download.Progress) {
 		fmt.Printf("\r  %s %5.1f%%  %d/%d pieces  %d peers ", bar(p.Done, p.Total, 30),
 			100*float64(p.Done)/float64(p.Total), p.Done, p.Total, p.Peers)
 	})
 	fmt.Println()
 	if err != nil {
-		return err
+		return fmt.Errorf("%w (progress is kept in %s; run the same command again to resume)", err, partPath)
 	}
-	if err := t.VerifyFile(f); err != nil {
+	if err := t.VerifyFile(st); err != nil {
 		return fmt.Errorf("final check failed: %w", err)
 	}
-	if err := f.Close(); err != nil {
+	if err := st.Close(); err != nil {
 		return err
 	}
 	if err := os.Rename(partPath, outPath); err != nil {
@@ -145,9 +187,10 @@ func fetch(tf *torrentfile.TorrentFile, outPath string, verbose bool) error {
 	}
 
 	elapsed := time.Since(start)
-	speed := float64(tf.Length) / elapsed.Seconds()
-	fmt.Printf("✓ saved %s, all %d pieces SHA-1 verified (%s in %s, %s/s)\n",
-		outPath, len(tf.PieceHashes), humanBytes(tf.Length), elapsed.Round(time.Millisecond), humanBytes(int64(speed)))
+	fetched := tf.Length * int64(len(tf.PieceHashes)-resumed) / int64(len(tf.PieceHashes))
+	speed := float64(fetched) / elapsed.Seconds()
+	fmt.Printf("✓ saved %s, all %d pieces SHA-1 verified (%s downloaded in %s, %s/s)\n",
+		outPath, len(tf.PieceHashes), humanBytes(fetched), elapsed.Round(time.Millisecond), humanBytes(int64(speed)))
 	return nil
 }
 
