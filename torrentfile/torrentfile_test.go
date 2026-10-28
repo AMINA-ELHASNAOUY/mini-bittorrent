@@ -134,3 +134,29 @@ func TestParseRejectsWrongPieceCount(t *testing.T) {
 		t.Fatal("expected an error when piece hashes don't cover the file")
 	}
 }
+
+func TestFromInfo(t *testing.T) {
+	info := map[string]interface{}{
+		"name": "a.bin", "length": int64(20), "piece length": int64(16), "pieces": strings.Repeat("y", 40),
+	}
+	infoBytes, _ := bencode.Encode(info)
+	hash := sha1.Sum(infoBytes)
+
+	tf, raw, err := FromInfo(infoBytes, hash, []string{"udp://t.test:80", "http://t2.test/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tf.InfoHash != hash || tf.Name != "a.bin" || len(tf.Trackers()) != 2 {
+		t.Fatalf("got %+v", tf)
+	}
+	again, err := Parse(bytes.NewReader(raw))
+	if err != nil || again.InfoHash != hash {
+		t.Fatalf("saved .torrent doesn't round-trip: %v", err)
+	}
+	if _, _, err := FromInfo(infoBytes, [20]byte{1}, nil); err == nil {
+		t.Error("expected an error for metadata that doesn't match the hash")
+	}
+	if tf, _, err := FromInfo(infoBytes, hash, nil); err != nil || len(tf.Trackers()) != 0 {
+		t.Errorf("trackerless metadata should parse: %v", err)
+	}
+}

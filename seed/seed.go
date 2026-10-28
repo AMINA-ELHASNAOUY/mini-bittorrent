@@ -33,6 +33,7 @@ type Server struct {
 	Length      int64
 	Data        io.ReaderAt // where piece data is read from
 	MaxPeers    int         // connections served at once (default 20)
+	Info        []byte      // optional raw info dict; enables ut_metadata so magnet-link peers can get it
 	Logger      *log.Logger // optional
 
 	bitfield peer.Bitfield
@@ -171,15 +172,34 @@ func (s *Server) serve(conn net.Conn) error {
 	if hs.InfoHash != s.InfoHash {
 		return errors.New("handshake for a torrent we don't serve")
 	}
-	if _, err := conn.Write(peer.NewHandshake(s.InfoHash, s.PeerID).Serialize()); err != nil {
+	reply := peer.NewHandshake(s.InfoHash, s.PeerID)
+	extensions := hs.SupportsExtensions() && s.Info != nil
+	if extensions {
+		reply.SetExtensions()
+	}
+	if _, err := conn.Write(reply.Serialize()); err != nil {
 		return err
 	}
 	if _, err := conn.Write((&peer.Message{ID: peer.MsgBitfield, Payload: s.bitfield}).Serialize()); err != nil {
 		return err
 	}
+	if extensions {
+		hello, err := peer.FormatExtended(0, map[string]interface{}{
+			"m":             map[string]interface{}{"ut_metadata": int64(metadataID)},
+			"metadata_size": int64(len(s.Info)),
+			"v":             "mini-bittorrent",
+		}, nil)
+		if err != nil {
+			return err
+		}
+		if _, err := conn.Write(hello.Serialize()); err != nil {
+			return err
+		}
+	}
 	s.logf("peer %s: connected", conn.RemoteAddr())
 
 	choked := true
+	var remoteMetadataID byte
 	for {
 		conn.SetDeadline(time.Now().Add(idleTimeout))
 		msg, err := peer.ReadMessage(conn)
@@ -211,8 +231,65 @@ func (s *Server) serve(conn net.Conn) error {
 			if err := s.serveRequest(conn, msg); err != nil {
 				return err
 			}
+		case peer.MsgExtended:
+			if !extensions {
+				continue
+			}
+			extID, dict, _, err := peer.ParseExtended(msg)
+			if err != nil {
+				return err
+			}
+			switch extID {
+			case 0: // their extension handshake: learn their ut_metadata ID
+				m, _ := dict["m"].(map[string]interface{})
+				if id, ok := m["ut_metadata"].(int64); ok && id > 0 && id < 256 {
+					remoteMetadataID = byte(id)
+				}
+			case metadataID:
+				if remoteMetadataID == 0 {
+					continue
+				}
+				if err := s.serveMetadata(conn, remoteMetadataID, dict); err != nil {
+					return err
+				}
+			}
 		}
 	}
+}
+
+// metadataID is the extended-message ID we ask peers to use for ut_metadata.
+const metadataID = 2
+
+// serveMetadata answers a ut_metadata request (BEP 9) with one 16 KiB piece
+// of the info dictionary, or a reject if the piece doesn't exist.
+func (s *Server) serveMetadata(conn net.Conn, remoteID byte, req map[string]interface{}) error {
+	const block = 16384
+	msgType, _ := req["msg_type"].(int64)
+	if msgType != 0 {
+		return nil
+	}
+	piece, _ := req["piece"].(int64)
+	numPieces := int64((len(s.Info) + block - 1) / block)
+
+	var reply *peer.Message
+	var err error
+	if piece < 0 || piece >= numPieces {
+		reply, err = peer.FormatExtended(remoteID, map[string]interface{}{"msg_type": int64(2), "piece": piece}, nil)
+	} else {
+		start := piece * block
+		end := start + block
+		if end > int64(len(s.Info)) {
+			end = int64(len(s.Info))
+		}
+		reply, err = peer.FormatExtended(remoteID, map[string]interface{}{
+			"msg_type": int64(1), "piece": piece, "total_size": int64(len(s.Info)),
+		}, s.Info[start:end])
+	}
+	if err != nil {
+		return err
+	}
+	_, err = conn.Write(reply.Serialize())
+	return err
 }
 
 func (s *Server) serveRequest(conn net.Conn, msg *peer.Message) error {

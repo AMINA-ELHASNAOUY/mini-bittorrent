@@ -2,6 +2,7 @@ package torrentfile
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha1"
 	"fmt"
 	"io"
@@ -29,6 +30,7 @@ type TorrentFile struct {
 	Name         string     // file name (single-file) or root directory name (multi-file)
 	Files        []File     // always at least one entry
 	MultiFile    bool       // true when the torrent describes a directory
+	InfoBytes    []byte     // the bencoded info dict (what InfoHash is the hash of)
 }
 
 // Trackers returns every tracker URL to try, best first and without duplicates:
@@ -61,7 +63,42 @@ func Open(path string) (*TorrentFile, error) {
 	return Parse(f)
 }
 
-// Parse reads a bencoded .torrent from r.
+// FromInfo builds a TorrentFile from a raw bencoded info dictionary, as
+// received from peers when starting from a magnet link. It checks that the
+// bytes hash to wantHash, and returns the bencoded .torrent so it can be saved.
+func FromInfo(info []byte, wantHash [20]byte, trackers []string) (*TorrentFile, []byte, error) {
+	if sha1.Sum(info) != wantHash {
+		return nil, nil, fmt.Errorf("metadata does not match the info hash")
+	}
+	decoded, err := bencode.Decode(bufio.NewReader(bytes.NewReader(info)))
+	if err != nil {
+		return nil, nil, fmt.Errorf("decoding metadata: %w", err)
+	}
+	top := map[string]interface{}{"info": decoded}
+	if len(trackers) > 0 {
+		top["announce"] = trackers[0]
+		tiers := make([]interface{}, len(trackers))
+		for i, t := range trackers {
+			tiers[i] = []interface{}{t}
+		}
+		top["announce-list"] = tiers
+	}
+	raw, err := bencode.Encode(top)
+	if err != nil {
+		return nil, nil, err
+	}
+	tf, err := Parse(bytes.NewReader(raw))
+	if err != nil {
+		return nil, nil, err
+	}
+	if tf.InfoHash != wantHash {
+		return nil, nil, fmt.Errorf("metadata is not in canonical bencoding")
+	}
+	return tf, raw, nil
+}
+
+// Parse reads a bencoded .torrent from r. A torrent without trackers is
+// valid: its peers have to be found through the DHT.
 func Parse(r io.Reader) (*TorrentFile, error) {
 	decoded, err := bencode.Decode(bufio.NewReader(r))
 	if err != nil {
@@ -89,18 +126,15 @@ func Parse(r io.Reader) (*TorrentFile, error) {
 			}
 		}
 	}
-	if len(tf.Trackers()) == 0 {
-		return nil, fmt.Errorf("no tracker URL (trackerless/DHT torrents are not supported)")
-	}
-
 	info, ok := dict["info"].(map[string]interface{})
 	if !ok {
 		return nil, fmt.Errorf("missing or invalid info dict")
 	}
 
-	if tf.InfoHash, err = hashInfoDict(info); err != nil {
+	if tf.InfoBytes, err = bencode.Encode(info); err != nil {
 		return nil, err
 	}
+	tf.InfoHash = sha1.Sum(tf.InfoBytes)
 
 	tf.PieceLength, _ = info["piece length"].(int64)
 	tf.Name, _ = info["name"].(string)
@@ -186,16 +220,9 @@ func checkPathComponent(s string) error {
 	return nil
 }
 
-// hashInfoDict re-encodes the info dict and returns its SHA-1 hash.
-// The info hash is how peers/trackers uniquely identify a torrent.
-// Bencoding is canonical (sorted keys), so re-encoding gives back the original bytes.
-func hashInfoDict(info map[string]interface{}) ([20]byte, error) {
-	encoded, err := bencode.Encode(info)
-	if err != nil {
-		return [20]byte{}, err
-	}
-	return sha1.Sum(encoded), nil
-}
+// Note on the info hash: it is the SHA-1 of the bencoded info dict. Bencoding
+// is canonical (sorted keys, one encoding per value), so re-encoding the
+// decoded dict gives back exactly the original bytes.
 
 // splitPieceHashes splits the concatenated 20-byte SHA-1 hashes
 // into a slice of individual hashes.

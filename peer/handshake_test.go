@@ -53,3 +53,30 @@ func TestReadHandshakeEmptyPstrlen(t *testing.T) {
 		t.Fatal("expected error for pstrlen=0, got nil")
 	}
 }
+
+func TestHandshakeExtensionBit(t *testing.T) {
+	h := NewHandshake([20]byte{1}, [20]byte{2})
+	if h.SupportsExtensions() {
+		t.Fatal("extensions should be off by default")
+	}
+	h.SetExtensions()
+	parsed, err := ReadHandshake(bytes.NewReader(h.Serialize()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !parsed.SupportsExtensions() || parsed.Reserved[5] != 0x10 {
+		t.Fatalf("reserved = %v", parsed.Reserved)
+	}
+}
+
+func TestExtendedMessageRoundTrip(t *testing.T) {
+	m, err := FormatExtended(3, map[string]interface{}{"msg_type": int64(1), "piece": int64(0)}, []byte("raw-bytes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, _ := ReadMessage(bytes.NewReader(m.Serialize()))
+	id, dict, trailing, err := ParseExtended(parsed)
+	if err != nil || id != 3 || dict["piece"] != int64(0) || string(trailing) != "raw-bytes" {
+		t.Fatalf("got id=%d dict=%v trailing=%q err=%v", id, dict, trailing, err)
+	}
+}
