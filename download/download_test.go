@@ -1,0 +1,144 @@
+package download
+
+import (
+	"bytes"
+	"crypto/rand"
+	"os"
+	"path/filepath"
+	"sync/atomic"
+	"testing"
+
+	"mini-bittorrent/internal/localswarm"
+	"mini-bittorrent/torrentfile"
+	"mini-bittorrent/tracker"
+)
+
+// memFile is an in-memory io.WriterAt / io.ReaderAt.
+type memFile struct{ buf []byte }
+
+func (m *memFile) WriteAt(p []byte, off int64) (int, error) { return copy(m.buf[off:], p), nil }
+func (m *memFile) ReadAt(p []byte, off int64) (int, error)  { return copy(p, m.buf[off:]), nil }
+
+func randomData(t *testing.T, n int) []byte {
+	t.Helper()
+	data := make([]byte, n)
+	if _, err := rand.Read(data); err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+// setup starts a local swarm and returns a Torrent wired to its peers via the tracker.
+func setup(t *testing.T, data []byte, pieceLength int, specs []localswarm.SeederSpec) *Torrent {
+	t.Helper()
+	sw, err := localswarm.Start("file.bin", data, pieceLength, specs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(sw.Close)
+
+	tf, err := torrentfile.Parse(bytes.NewReader(sw.Torrent))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var peerID [20]byte
+	copy(peerID[:], "-MB0001-testtesttest")
+	res, err := tracker.Announce(nil, tracker.Request{
+		Announce: tf.Announce, InfoHash: tf.InfoHash, PeerID: peerID, Port: 6881, Left: tf.Length,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tor := &Torrent{PeerID: peerID, InfoHash: tf.InfoHash, PieceHashes: tf.PieceHashes,
+		PieceLength: tf.PieceLength, Length: tf.Length}
+	for _, p := range res.Peers {
+		tor.Peers = append(tor.Peers, p.String())
+	}
+	return tor
+}
+
+func TestDownloadFromSingleSeeder(t *testing.T) {
+	// Uneven size: the last piece and the last block are both short.
+	data := randomData(t, 3*65536+12345)
+	tor := setup(t, data, 65536, []localswarm.SeederSpec{{}})
+
+	out := &memFile{buf: make([]byte, len(data))}
+	var calls int32
+	if err := tor.Download(out, func(Progress) { atomic.AddInt32(&calls, 1) }); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(out.buf, data) {
+		t.Fatal("downloaded bytes differ from the original")
+	}
+	if calls != int32(len(tor.PieceHashes)) {
+		t.Errorf("progress called %d times, want %d", calls, len(tor.PieceHashes))
+	}
+}
+
+func TestDownloadSplitAcrossPartialSeeders(t *testing.T) {
+	// Neither seeder has the whole file: even pieces on one, odd on the other.
+	data := randomData(t, 10*32768)
+	tor := setup(t, data, 32768, []localswarm.SeederSpec{
+		{Has: func(i int) bool { return i%2 == 0 }},
+		{Has: func(i int) bool { return i%2 == 1 }},
+	})
+
+	out := &memFile{buf: make([]byte, len(data))}
+	if err := tor.Download(out, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(out.buf, data) {
+		t.Fatal("downloaded bytes differ from the original")
+	}
+}
+
+func TestCorruptPeerIsDroppedAndPiecesRetried(t *testing.T) {
+	// One honest seeder and two that corrupt every block. Every bad piece must
+	// fail the SHA-1 check, go back on the queue and be fetched from the honest peer.
+	data := randomData(t, 20*16384)
+	tor := setup(t, data, 16384, []localswarm.SeederSpec{{Corrupt: true}, {}, {Corrupt: true}})
+
+	out := &memFile{buf: make([]byte, len(data))}
+	if err := tor.Download(out, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := tor.VerifyFile(out); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOnlyCorruptPeersFails(t *testing.T) {
+	data := randomData(t, 8*16384)
+	tor := setup(t, data, 16384, []localswarm.SeederSpec{{Corrupt: true}})
+
+	err := tor.Download(&memFile{buf: make([]byte, len(data))}, nil)
+	if err == nil {
+		t.Fatal("expected an error when every peer sends corrupt data")
+	}
+}
+
+func TestDownloadToDisk(t *testing.T) {
+	data := randomData(t, 5*16384+1)
+	tor := setup(t, data, 16384, []localswarm.SeederSpec{{}, {}})
+
+	path := filepath.Join(t.TempDir(), "out.bin")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := tor.Download(f, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(path)
+	if !bytes.Equal(got, data) {
+		t.Fatal("file on disk differs from the original")
+	}
+}
+
+func TestNoPeers(t *testing.T) {
+	tor := &Torrent{PieceHashes: make([][20]byte, 1), PieceLength: 1, Length: 1}
+	if err := tor.Download(&memFile{buf: make([]byte, 1)}, nil); err == nil {
+		t.Fatal("expected an error with no peers")
+	}
+}
