@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"mini-bittorrent/bencode"
@@ -61,8 +62,68 @@ func BuildURL(req Request) (string, error) {
 	return base.String(), nil
 }
 
-// Announce contacts the tracker and returns the list of peers.
+// Announce contacts one tracker (http, https or udp) and returns its peers.
+// client is only used for HTTP trackers and may be nil.
 func Announce(client *http.Client, req Request) (*Response, error) {
+	if strings.HasPrefix(req.Announce, "udp://") {
+		return announceUDP(req, udpTimeout)
+	}
+	return announceHTTP(client, req)
+}
+
+// AnnounceAll asks every tracker in parallel and merges the peers they return,
+// along with the error of each tracker that failed. Once some tracker has
+// answered, it waits at most `grace` for slower ones instead of stalling on
+// dead trackers. An empty peer list means every tracker failed.
+func AnnounceAll(trackers []string, req Request, grace time.Duration) ([]Peer, []error) {
+	type result struct {
+		url   string
+		peers []Peer
+		err   error
+	}
+	results := make(chan result, len(trackers))
+	for _, u := range trackers {
+		go func(u string) {
+			r := req
+			r.Announce = u
+			res, err := Announce(nil, r)
+			if err != nil {
+				results <- result{url: u, err: err}
+				return
+			}
+			results <- result{url: u, peers: res.Peers}
+		}(u)
+	}
+
+	seen := map[string]bool{}
+	var peers []Peer
+	var errs []error
+	var graceTimer <-chan time.Time
+	for pending := len(trackers); pending > 0; pending-- {
+		var r result
+		select {
+		case r = <-results:
+		case <-graceTimer:
+			return peers, errs
+		}
+		if r.err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", r.url, r.err))
+			continue
+		}
+		for _, p := range r.peers {
+			if key := p.String(); !seen[key] {
+				seen[key] = true
+				peers = append(peers, p)
+			}
+		}
+		if graceTimer == nil && len(peers) > 0 {
+			graceTimer = time.After(grace)
+		}
+	}
+	return peers, errs
+}
+
+func announceHTTP(client *http.Client, req Request) (*Response, error) {
 	u, err := BuildURL(req)
 	if err != nil {
 		return nil, err
