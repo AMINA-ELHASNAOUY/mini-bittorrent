@@ -30,6 +30,14 @@ const (
 // FetchAny tries peers (several at a time) until one delivers metadata that
 // hashes to infoHash, and returns the raw bencoded info dictionary.
 func FetchAny(ctx context.Context, peers []string, infoHash, peerID [20]byte) ([]byte, error) {
+	return FetchAnyDial(ctx, nil, peers, infoHash, peerID)
+}
+
+// DialFunc opens a connection to a peer; nil means TCP.
+type DialFunc func(addr string) (net.Conn, error)
+
+// FetchAnyDial is FetchAny with a custom dialer (e.g. one that also tries uTP).
+func FetchAnyDial(ctx context.Context, dial DialFunc, peers []string, infoHash, peerID [20]byte) ([]byte, error) {
 	if len(peers) == 0 {
 		return nil, errors.New("no peers to fetch metadata from")
 	}
@@ -52,7 +60,7 @@ func FetchAny(ctx context.Context, peers []string, infoHash, peerID [20]byte) ([
 				results <- result{err: ctx.Err()}
 				return
 			}
-			info, err := Fetch(ctx, addr, infoHash, peerID)
+			info, err := fetch(ctx, dial, addr, infoHash, peerID)
 			if err != nil {
 				err = fmt.Errorf("%s: %w", addr, err)
 			}
@@ -73,10 +81,20 @@ func FetchAny(ctx context.Context, peers []string, infoHash, peerID [20]byte) ([
 
 // Fetch downloads the metadata from a single peer.
 func Fetch(ctx context.Context, addr string, infoHash, peerID [20]byte) ([]byte, error) {
-	var d net.Dialer
-	dialCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	conn, err := d.DialContext(dialCtx, "tcp", addr)
-	cancel()
+	return fetch(ctx, nil, addr, infoHash, peerID)
+}
+
+func fetch(ctx context.Context, dial DialFunc, addr string, infoHash, peerID [20]byte) ([]byte, error) {
+	var conn net.Conn
+	var err error
+	if dial != nil {
+		conn, err = dial(addr)
+	} else {
+		var d net.Dialer
+		dialCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		conn, err = d.DialContext(dialCtx, "tcp", addr)
+		cancel()
+	}
 	if err != nil {
 		return nil, err
 	}

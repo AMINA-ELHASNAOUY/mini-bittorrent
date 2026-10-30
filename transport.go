@@ -58,8 +58,10 @@ func (t *transport) listeners() []net.Listener {
 }
 
 // Dial connects to a peer. With uTP on, TCP and uTP are tried at the same
-// time and the first to connect wins ("happy eyeballs"): a peer that only
-// speaks one of them is reached without waiting for the other to time out.
+// time, so a peer that speaks only one of them costs no timeout. uTP is
+// preferred, as in other clients: if TCP connects first we still wait a
+// moment for uTP. (Some clients with TCP turned off accept the TCP
+// connection and then reset it, so the first to connect isn't always usable.)
 func (t *transport) Dial(addr string) (net.Conn, error) {
 	if t.utp == nil {
 		return net.DialTimeout("tcp", addr, dialTimeout)
@@ -68,30 +70,56 @@ func (t *transport) Dial(addr string) (net.Conn, error) {
 		c   net.Conn
 		err error
 	}
-	results := make(chan result, 2)
+	tcpCh, utpCh := make(chan result, 1), make(chan result, 1)
 	go func() {
 		c, err := net.DialTimeout("tcp", addr, dialTimeout)
-		results <- result{c, err}
+		tcpCh <- result{c, err}
 	}()
 	go func() {
 		c, err := t.utp.Dial(addr, dialTimeout)
-		results <- result{c, err}
+		utpCh <- result{c, err}
 	}()
-	first := <-results
-	if first.err == nil {
-		go func() { // close the loser, whenever it finishes
-			if r := <-results; r.err == nil {
+	closeLater := func(ch chan result) {
+		go func() {
+			if r := <-ch; r.err == nil {
 				r.c.Close()
 			}
 		}()
-		return first.c, nil
 	}
-	second := <-results
-	if second.err == nil {
-		return second.c, nil
+	select {
+	case u := <-utpCh:
+		if u.err == nil {
+			closeLater(tcpCh)
+			return u.c, nil
+		}
+		tc := <-tcpCh
+		if tc.err == nil {
+			return tc.c, nil
+		}
+		return nil, errors.Join(tc.err, u.err)
+	case tc := <-tcpCh:
+		if tc.err != nil {
+			u := <-utpCh
+			if u.err == nil {
+				return u.c, nil
+			}
+			return nil, errors.Join(tc.err, u.err)
+		}
+		select {
+		case u := <-utpCh:
+			if u.err == nil {
+				tc.c.Close()
+				return u.c, nil
+			}
+		case <-time.After(utpGrace):
+			closeLater(utpCh)
+		}
+		return tc.c, nil
 	}
-	return nil, errors.Join(first.err, second.err)
 }
+
+// utpGrace is how long a TCP connection waits for uTP to connect too.
+const utpGrace = 300 * time.Millisecond
 
 func (t *transport) Close() {
 	for _, ln := range t.listeners() {

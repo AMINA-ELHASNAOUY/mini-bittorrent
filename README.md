@@ -100,7 +100,7 @@ flowchart LR
 - **Peers without a tracker.** For magnet links the DHT is searched alongside the trackers; for `.torrent` files it's the fallback when trackers return nothing. The lookup walks towards the info hash by XOR distance, asking up to 8 nodes at a time.
 - **Tit-for-tat while downloading.** Pieces are uploaded as soon as they are verified and on disk, on the same connections we download on, and incoming peers are accepted mid-download. Every 10 s the choker gives its 3 regular upload slots to the interested peers that sent us the most data in the last round, so peers that give back get more; one optimistic slot rotates every 30 s so newcomers with nothing to trade yet can get started. Anti-snubbing: a peer that hasn't sent us a block in 60 s loses its regular slot. When we finish we send NOT_INTERESTED and keep serving peers still mid-download for up to 15 s instead of hanging up on them.
 - **uTP, from the spec.** BEP 29 on top of a plain UDP socket: 20-byte headers, connection IDs, in-order delivery with a reorder buffer, cumulative and selective acks (a packet with 3 later packets acked is resent at once), timeouts with the TCP RTT estimator and backoff. Congestion control is LEDBAT: the peer echoes how long our packets took; subtracting the lowest value of the last two minutes cancels the clock offset and leaves the queuing delay we cause, and the window grows below 100 ms of it and shrinks above. So a torrent yields to everything else on your connection. Packets stay under 1280 bytes, so no IP fragmentation.
-- **TCP and uTP at once.** Outgoing connections try both at the same time and keep whichever connects first, so a peer that only speaks one of them costs no timeout. uTP and the DHT share one UDP port, as other clients expect: uTP packets are recognised by their first byte (type and version 1), DHT messages always start with `d`.
+- **TCP and uTP at once.** Outgoing connections try both at the same time, so a peer that only speaks one of them costs no timeout. uTP is preferred, as in other clients: if TCP connects first we wait 300 ms for uTP, because some clients with TCP turned off still accept the connection and then reset it. Magnet metadata is fetched the same way. uTP and the DHT share one UDP port, as other clients expect: uTP packets are recognised by their first byte (type and version 1), DHT messages always start with `d`.
 - **Upload to a few peers, not all.** Splitting upload bandwidth across everyone gives nobody a useful speed, so the seeder unchokes the peers it can send to fastest plus one *optimistic* slot that rotates every 30 s to give newcomers a chance, re-ranking every 10 s (or immediately when a slot frees up). A shared token bucket caps the total upload rate.
 - **A good DHT citizen when seeding.** The seeder runs a full DHT node on its port: it answers other nodes' queries, keeps a k-bucket routing table, stores peers that announce themselves (only with a token bound to their IP, so nobody can register someone else's address), and re-announces itself every 15 minutes. Downloads use a read-only client, since a laptop behind NAT can't reliably answer queries.
 - **Magnet = hash only.** The info dictionary is fetched from peers in 16 KiB pieces and only accepted if its SHA-1 matches the hash in the link, so a lying peer can't substitute a different torrent.
@@ -124,6 +124,7 @@ go test -race ./...
 - the tit-for-tat choker: the peer uploading to us fastest always keeps its slot, a snubbing peer loses it, the optimistic slot rotates, never more peers unchoked than allowed
 - uTP: 4 MiB each way at once, 512 KiB over a link that drops 10%, duplicates 5% and reorders packets, FIN/EOF, RESET for a refused connection, dial timeouts, 8 connections on one socket, LEDBAT backing off when delay rises
 - a full download over uTP only (our downloader against our seeder), and a dialer that reaches TCP-only and uTP-only peers
+- outside `go test`, [`scripts/interop_libtorrent.py`](scripts/interop_libtorrent.py) runs libtorrent with TCP disabled: it seeds to us by magnet link, then downloads from our seeder, both entirely over uTP
 - a read deadline firing in the middle of a message, and a 4 GiB length prefix being rejected
 - two corrupt seeders + one honest one: every bad piece is rejected, retried elsewhere, and the result verifies
 - endgame: with one very slow peer, the fast peer finishes the slow peer's piece (the test fails if endgame is turned off)
@@ -138,10 +139,10 @@ go test -race ./...
 ## Limitations
 
 Being upfront about scope:
-- uTP is tested against itself (including over a simulated lossy network), not yet against libutp/libtorrent
-  peers on the real internet, so interoperability with other clients' uTP is unverified
+- uTP interoperability is checked against libtorrent (the engine of qBittorrent and Deluge) on localhost, not
+  yet across a real internet path with real loss and delay
 - No protocol encryption (MSE/PE), so peers that require it won't connect
-- Fetching magnet metadata uses TCP only
+- BitTorrent v1 only: v2 and hybrid torrents work through their v1 info hash, v2-only torrents don't
 - Peers behind NAT can only reach us if the port is forwarded (no UPnP/NAT-PMP)
 - After the download, `-seed` hands over to the seed server, which drops the existing connections; peers find
   it again through trackers and the DHT
@@ -162,7 +163,7 @@ Being upfront about scope:
 - [x] Full DHT node (answer queries, announce_peer)
 - [x] Upload while downloading, with tit-for-tat
 - [x] uTP transport (BEP 29)
-- [ ] Test uTP against other clients on the real network
+- [x] uTP interop with libtorrent, both directions (`scripts/interop_libtorrent.py`)
 - [ ] Protocol encryption (MSE/PE)
 - [ ] Port mapping (UPnP / NAT-PMP)
 

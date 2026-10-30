@@ -18,6 +18,7 @@ import (
 	"mini-bittorrent/storage"
 	"mini-bittorrent/torrentfile"
 	"mini-bittorrent/tracker"
+	"mini-bittorrent/utp"
 )
 
 // dhtBootstrap is a variable so tests can point the DHT at local nodes.
@@ -117,7 +118,15 @@ func resolveMagnet(uri string, opts fetchOptions) (*torrentfile.TorrentFile, []b
 	fmt.Printf("→ fetching torrent metadata from %d peers…\n", len(peers))
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	info, err := metadata.FetchAny(ctx, peers, link.InfoHash, peerID)
+	// Metadata comes over TCP or uTP, whichever the peer answers first.
+	var dial metadata.DialFunc
+	if !opts.noUTP {
+		if sock, err := utp.NewSocket(":0"); err == nil {
+			defer sock.Close()
+			dial = (&transport{utp: sock}).Dial
+		}
+	}
+	info, err := metadata.FetchAnyDial(ctx, dial, peers, link.InfoHash, peerID)
 	if err != nil {
 		return nil, nil, nil, err
 	}
