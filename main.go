@@ -16,10 +16,10 @@ const usage = `mini-bittorrent: a BitTorrent client written from the protocol sp
 Usage:
   mini-bittorrent info     <file.torrent>
         show what's inside a .torrent
-  mini-bittorrent download [-o path] [-v] [-seed] [-port N] [-limit KiB/s] [-nodht] [-noutp] [-noupload] <file.torrent | "magnet:?...">
+  mini-bittorrent download [-o path] [-v] [-seed] [-port N] [-limit KiB/s] [-nodht] [-noutp] [-noupload] [-encryption prefer|require|off] <file.torrent | "magnet:?...">
         download it, uploading to other peers as it goes (tit-for-tat);
         re-run the same command to resume an interrupted download
-  mini-bittorrent seed     [-port N] [-limit KiB/s] [-noutp] [-v] <file.torrent> <path>
+  mini-bittorrent seed     [-port N] [-limit KiB/s] [-noutp] [-encryption prefer|require|off] [-v] <file.torrent> <path>
         upload a finished download to other peers
   mini-bittorrent demo     [-v]
         run a local swarm and download from it (no internet needed)

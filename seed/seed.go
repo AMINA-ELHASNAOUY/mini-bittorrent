@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"mini-bittorrent/internal/ratelimit"
+	"mini-bittorrent/mse"
 	"mini-bittorrent/peer"
 )
 
@@ -37,6 +38,7 @@ type Server struct {
 	MaxPeers    int         // connections served at once (default 20)
 	MaxUnchoked int         // peers uploaded to at once, incl. 1 optimistic slot (default 4)
 	RateLimit   int64       // total upload bytes per second; 0 = unlimited
+	Encryption  mse.Policy  // MSE/PE for incoming peers (default mse.Off: plaintext only)
 	// RechokeInterval is how often the choking algorithm re-ranks peers
 	// (default 10s, as in the reference client); the optimistic slot rotates every 3 rounds.
 	RechokeInterval time.Duration
@@ -59,7 +61,8 @@ type Server struct {
 
 // remote is one connected peer.
 type remote struct {
-	conn       net.Conn
+	conn       net.Conn // the raw connection (closed by Close)
+	stream     net.Conn // what we read and write: conn, or conn decrypted by MSE
 	writeMu    sync.Mutex
 	interested bool // guarded by Server.mu
 	choked     bool // whether WE choke THEM; guarded by Server.mu
@@ -71,8 +74,8 @@ type remote struct {
 func (r *remote) send(m *peer.Message) error {
 	r.writeMu.Lock()
 	defer r.writeMu.Unlock()
-	r.conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-	_, err := r.conn.Write(m.Serialize())
+	r.stream.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	_, err := r.stream.Write(m.Serialize())
 	return err
 }
 
@@ -237,7 +240,11 @@ func (s *Server) logf(format string, args ...interface{}) {
 }
 
 func (s *Server) serve(r *remote) error {
-	conn := r.conn
+	conn, err := mse.Accept(r.conn, s.InfoHash, s.Encryption)
+	if err != nil {
+		return err
+	}
+	r.stream = conn // set before anything else can send to this peer
 	conn.SetDeadline(time.Now().Add(10 * time.Second))
 	hs, err := peer.ReadHandshake(conn)
 	if err != nil {

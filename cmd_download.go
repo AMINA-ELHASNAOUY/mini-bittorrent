@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"mini-bittorrent/download"
 	"mini-bittorrent/magnet"
 	"mini-bittorrent/metadata"
+	"mini-bittorrent/mse"
 	"mini-bittorrent/storage"
 	"mini-bittorrent/torrentfile"
 	"mini-bittorrent/tracker"
@@ -34,6 +36,7 @@ type fetchOptions struct {
 	noUTP      bool     // TCP only
 	noUpload   bool     // don't upload while downloading
 	limitKiB   int64    // upload limit
+	encryption mse.Policy
 }
 
 // lingerAfterDownload is how long we keep serving peers that are still
@@ -50,16 +53,21 @@ func runDownload(args []string) error {
 	noDHT := fs.Bool("nodht", false, "don't look for peers in the DHT")
 	noUTP := fs.Bool("noutp", false, "use TCP only, no uTP")
 	noUpload := fs.Bool("noupload", false, "don't upload to other peers while downloading")
+	encryption := fs.String("encryption", "prefer", "protocol encryption (MSE/PE): prefer, require or off")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() != 1 {
-		return errors.New(`usage: mini-bittorrent download [-o path] [-v] [-seed] [-port N] [-limit KiB/s] [-nodht] [-noutp] [-noupload] <file.torrent | "magnet:?...">`)
+	policy, err := mse.ParsePolicy(*encryption)
+	if err != nil {
+		return err
 	}
-	opts := fetchOptions{verbose: *verbose, noDHT: *noDHT, port: *port, noUTP: *noUTP, noUpload: *noUpload, limitKiB: *limit}
+	if fs.NArg() != 1 {
+		return errors.New(`usage: mini-bittorrent download [-o path] [-v] [-seed] [-port N] [-limit KiB/s] [-nodht] [-noutp] [-noupload] [-encryption prefer|require|off] <file.torrent | "magnet:?...">`)
+	}
+	opts := fetchOptions{verbose: *verbose, noDHT: *noDHT, port: *port, noUTP: *noUTP, noUpload: *noUpload,
+		limitKiB: *limit, encryption: policy}
 
 	var tf *torrentfile.TorrentFile
-	var err error
 	if arg := fs.Arg(0); strings.HasPrefix(arg, "magnet:") {
 		var raw []byte
 		tf, raw, opts.extraPeers, err = resolveMagnet(arg, opts)
@@ -87,7 +95,7 @@ func runDownload(args []string) error {
 		return err
 	}
 	if *seedAfter {
-		return seedTorrent(tf, *outPath, seedOptions{port: *port, limitKiB: *limit, verbose: *verbose, noUTP: *noUTP})
+		return seedTorrent(tf, *outPath, seedOptions{port: *port, limitKiB: *limit, verbose: *verbose, noUTP: *noUTP, encryption: policy})
 	}
 	return nil
 }
@@ -119,12 +127,15 @@ func resolveMagnet(uri string, opts fetchOptions) (*torrentfile.TorrentFile, []b
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	// Metadata comes over TCP or uTP, whichever the peer answers first.
-	var dial metadata.DialFunc
+	rawDial := func(addr string) (net.Conn, error) { return net.DialTimeout("tcp", addr, dialTimeout) }
 	if !opts.noUTP {
 		if sock, err := utp.NewSocket(":0"); err == nil {
 			defer sock.Close()
-			dial = (&transport{utp: sock}).Dial
+			rawDial = (&transport{utp: sock}).Dial
 		}
+	}
+	dial := func(addr string) (net.Conn, error) {
+		return mse.Dial(func() (net.Conn, error) { return rawDial(addr) }, link.InfoHash, opts.encryption)
 	}
 	info, err := metadata.FetchAnyDial(ctx, dial, peers, link.InfoHash, peerID)
 	if err != nil {
@@ -261,6 +272,7 @@ func fetch(tf *torrentfile.TorrentFile, outPath string, opts fetchOptions) error
 	defer tr.Close()
 	opts.port = tr.port
 	t.Dial = tr.Dial
+	t.Encryption = opts.encryption
 	if !opts.noUpload {
 		t.Data = st
 		t.Listener = tr.Listener()

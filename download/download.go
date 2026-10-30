@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"mini-bittorrent/mse"
 	"mini-bittorrent/peer"
 )
 
@@ -58,6 +59,8 @@ type Torrent struct {
 	RechokeInterval time.Duration // how often the choker re-ranks peers (default 10s)
 	SnubTimeout     time.Duration // a peer that sends us nothing for this long loses its regular slot (default 60s)
 	UploadLimit     int64         // total upload bytes per second; 0 = unlimited
+	// Encryption is the MSE/PE policy for connections (default mse.Off: plaintext).
+	Encryption mse.Policy
 	// Linger keeps serving peers that are still downloading from us after
 	// our own download completes, until they lose interest or this much
 	// time passes (default 0: return as soon as the last piece is written).
@@ -216,7 +219,7 @@ func (t *Torrent) connect(addr string, ours peer.Bitfield) (*peer.Client, error)
 	if dial == nil {
 		dial = func(addr string) (net.Conn, error) { return net.DialTimeout("tcp", addr, 3*time.Second) }
 	}
-	conn, err := dial(addr)
+	conn, err := mse.Dial(func() (net.Conn, error) { return dial(addr) }, t.InfoHash, t.Encryption)
 	if err != nil {
 		return nil, err
 	}
@@ -248,6 +251,13 @@ func (t *Torrent) acceptLoop(sw *swarm, pk *picker, results chan<- *pieceResult,
 		go func() {
 			defer inbound.Done()
 			defer func() { mu.Lock(); n--; mu.Unlock() }()
+			raw := conn
+			conn, err := mse.Accept(raw, t.InfoHash, t.Encryption)
+			if err != nil {
+				t.logf("incoming %s: %v", raw.RemoteAddr(), err)
+				raw.Close()
+				return
+			}
 			sent := sw.ourBitfield()
 			c, err := peer.Accept(conn, t.InfoHash, t.PeerID, len(t.PieceHashes), sent)
 			if err != nil {

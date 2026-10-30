@@ -16,7 +16,8 @@ fetches the torrent's metadata from peers when starting from a magnet link, down
 parallel (rarest first, with an endgame mode), checks every piece against its SHA-1 hash, drops peers that send
 corrupt data and resumes interrupted downloads. While downloading it uploads the pieces it already has, giving
 its upload slots to the peers that upload to it fastest (tit-for-tat). It talks to peers over TCP and over
-uTP, its own implementation of BitTorrent's UDP transport with LEDBAT congestion control, and can keep seeding
+uTP, its own implementation of BitTorrent's UDP transport with LEDBAT congestion control, encrypts connections
+with MSE/PE (and talks to peers that require it), and can keep seeding
 afterwards, running a full DHT node on the same port so even trackerless torrents can be found.
 
 ```text
@@ -50,7 +51,8 @@ go build -o mini-bittorrent .
 ```
 
 Downloads accept peers on `-port` (default 6881, TCP and uTP) and upload while downloading; `-noupload` turns
-that off, `-limit` caps upload speed, and `-noutp` sticks to TCP.
+that off, `-limit` caps upload speed, and `-noutp` sticks to TCP. Connections are encrypted when the peer supports
+it (`-encryption prefer`, the default); `require` refuses plaintext peers, `off` never encrypts.
 
 Interrupted? Run the same `download` command again: data lives in `<name>.part` until every piece is verified,
 and pieces that are already on disk and valid are skipped.
@@ -86,6 +88,7 @@ flowchart LR
 | `metadata` | Downloads the info dictionary from peers for magnet links | BEP 9, [BEP 10](https://www.bittorrent.org/beps/bep_0010.html) |
 | `peer` | Handshake (both directions), wire messages, bitfields, extension protocol, the per-peer connection | BEP 3, BEP 10 |
 | `utp` | uTP: reliable ordered streams over UDP, selective acks, retransmission, LEDBAT congestion control; shares its port with the DHT | [BEP 29](https://www.bittorrent.org/beps/bep_0029.html) |
+| `mse` | Message Stream Encryption: Diffie-Hellman key exchange, RC4 stream, plaintext/encrypted detection on incoming connections | [MSE/PE spec](https://wiki.vuze.com/w/Message_Stream_Encryption) |
 | `download` | Rarest-first + endgame piece picker, request pipelining, hash verification, resume; uploads while downloading with a tit-for-tat choker | BEP 3 |
 | `seed` | Serves verified pieces (and metadata) to incoming peers over TCP and uTP, with a choking algorithm and upload rate limit | BEP 3, BEP 9 |
 | `storage` | Maps the torrent's byte stream onto files, splitting reads/writes at file boundaries | — |
@@ -101,6 +104,7 @@ flowchart LR
 - **Tit-for-tat while downloading.** Pieces are uploaded as soon as they are verified and on disk, on the same connections we download on, and incoming peers are accepted mid-download. Every 10 s the choker gives its 3 regular upload slots to the interested peers that sent us the most data in the last round, so peers that give back get more; one optimistic slot rotates every 30 s so newcomers with nothing to trade yet can get started. Anti-snubbing: a peer that hasn't sent us a block in 60 s loses its regular slot. When we finish we send NOT_INTERESTED and keep serving peers still mid-download for up to 15 s instead of hanging up on them.
 - **uTP, from the spec.** BEP 29 on top of a plain UDP socket: 20-byte headers, connection IDs, in-order delivery with a reorder buffer, cumulative and selective acks (a packet with 3 later packets acked is resent at once), timeouts with the TCP RTT estimator and backoff. Congestion control is LEDBAT: the peer echoes how long our packets took; subtracting the lowest value of the last two minutes cancels the clock offset and leaves the queuing delay we cause, and the window grows below 100 ms of it and shrinks above. So a torrent yields to everything else on your connection. Packets stay under 1280 bytes, so no IP fragmentation.
 - **TCP and uTP at once.** Outgoing connections try both at the same time, so a peer that only speaks one of them costs no timeout. uTP is preferred, as in other clients: if TCP connects first we wait 300 ms for uTP, because some clients with TCP turned off still accept the connection and then reset it. Magnet metadata is fetched the same way. uTP and the DHT share one UDP port, as other clients expect: uTP packets are recognised by their first byte (type and version 1), DHT messages always start with `d`.
+- **Encryption that works with other clients.** MSE/PE does a 768-bit Diffie-Hellman exchange, then encrypts the stream with RC4 keyed from the shared secret and the info hash. The info hash itself never crosses the wire: the listener recognises the torrent from a hash of it. Incoming connections are told apart by their first 20 bytes (a plaintext handshake always starts with `\x13BitTorrent protocol`, an encrypted one with a random key). With `prefer`, a peer that hangs up on our key is simply dialed again in plaintext. MSE was designed against traffic shaping, not to keep data secret, and RC4 is weak by today's standards; the point is reaching peers that refuse plaintext.
 - **Upload to a few peers, not all.** Splitting upload bandwidth across everyone gives nobody a useful speed, so the seeder unchokes the peers it can send to fastest plus one *optimistic* slot that rotates every 30 s to give newcomers a chance, re-ranking every 10 s (or immediately when a slot frees up). A shared token bucket caps the total upload rate.
 - **A good DHT citizen when seeding.** The seeder runs a full DHT node on its port: it answers other nodes' queries, keeps a k-bucket routing table, stores peers that announce themselves (only with a token bound to their IP, so nobody can register someone else's address), and re-announces itself every 15 minutes. Downloads use a read-only client, since a laptop behind NAT can't reliably answer queries.
 - **Magnet = hash only.** The info dictionary is fetched from peers in 16 KiB pieces and only accepted if its SHA-1 matches the hash in the link, so a lying peer can't substitute a different torrent.
@@ -118,13 +122,14 @@ flowchart LR
 go test -race ./...
 ```
 
-108 tests, run in CI with the race detector. Highlights:
+117 tests, run in CI with the race detector. Highlights:
 - end-to-end downloads from local seeders: uneven last piece, a file split across two partial seeders, a multi-file folder written to disk
 - two leechers that can each reach only a half-seeder: neither can finish alone, both finish by uploading to each other while downloading (one of them only reachable as an incoming connection)
 - the tit-for-tat choker: the peer uploading to us fastest always keeps its slot, a snubbing peer loses it, the optimistic slot rotates, never more peers unchoked than allowed
 - uTP: 4 MiB each way at once, 512 KiB over a link that drops 10%, duplicates 5% and reorders packets, FIN/EOF, RESET for a refused connection, dial timeouts, 8 connections on one socket, LEDBAT backing off when delay rises
 - a full download over uTP only (our downloader against our seeder), and a dialer that reaches TCP-only and uTP-only peers
-- outside `go test`, [`scripts/interop_libtorrent.py`](scripts/interop_libtorrent.py) runs libtorrent with TCP disabled: it seeds to us by magnet link, then downloads from our seeder, both entirely over uTP
+- MSE: RC4 and plaintext methods, nothing readable on the wire, wrong torrent and plaintext-under-`require` rejected, fallback to a plaintext-only peer, initial payload carried inside the handshake, degenerate DH keys refused
+- outside `go test`, [`scripts/interop_libtorrent.py`](scripts/interop_libtorrent.py) runs libtorrent twice, once with TCP disabled (everything over our uTP) and once requiring RC4 encryption; each time it seeds to us by magnet link, then downloads from our seeder
 - a read deadline firing in the middle of a message, and a 4 GiB length prefix being rejected
 - two corrupt seeders + one honest one: every bad piece is rejected, retried elsewhere, and the result verifies
 - endgame: with one very slow peer, the fast peer finishes the slow peer's piece (the test fails if endgame is turned off)
@@ -141,7 +146,6 @@ go test -race ./...
 Being upfront about scope:
 - uTP interoperability is checked against libtorrent (the engine of qBittorrent and Deluge) on localhost, not
   yet across a real internet path with real loss and delay
-- No protocol encryption (MSE/PE), so peers that require it won't connect
 - BitTorrent v1 only: v2 and hybrid torrents work through their v1 info hash, v2-only torrents don't
 - Peers behind NAT can only reach us if the port is forwarded (no UPnP/NAT-PMP)
 - After the download, `-seed` hands over to the seed server, which drops the existing connections; peers find
@@ -164,7 +168,7 @@ Being upfront about scope:
 - [x] Upload while downloading, with tit-for-tat
 - [x] uTP transport (BEP 29)
 - [x] uTP interop with libtorrent, both directions (`scripts/interop_libtorrent.py`)
-- [ ] Protocol encryption (MSE/PE)
+- [x] Protocol encryption (MSE/PE), checked against libtorrent with encryption required
 - [ ] Port mapping (UPnP / NAT-PMP)
 
 ## License

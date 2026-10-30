@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"mini-bittorrent/dht"
+	"mini-bittorrent/mse"
 	"mini-bittorrent/seed"
 	"mini-bittorrent/storage"
 	"mini-bittorrent/torrentfile"
@@ -24,24 +25,30 @@ func runSeed(args []string) error {
 	verbose := fs.Bool("v", false, "log per-peer events")
 	limit := fs.Int64("limit", 0, "upload limit in KiB/s (0 = unlimited)")
 	noUTP := fs.Bool("noutp", false, "accept TCP only, no uTP")
+	encryption := fs.String("encryption", "prefer", "protocol encryption (MSE/PE): prefer (accept both), require or off")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	policy, err := mse.ParsePolicy(*encryption)
+	if err != nil {
+		return err
+	}
 	if fs.NArg() != 2 {
-		return errors.New("usage: mini-bittorrent seed [-port N] [-limit KiB/s] [-noutp] [-v] <file.torrent> <path to the downloaded file or folder>")
+		return errors.New("usage: mini-bittorrent seed [-port N] [-limit KiB/s] [-noutp] [-encryption prefer|require|off] [-v] <file.torrent> <path to the downloaded file or folder>")
 	}
 	tf, err := torrentfile.Open(fs.Arg(0))
 	if err != nil {
 		return err
 	}
-	return seedTorrent(tf, fs.Arg(1), seedOptions{port: *port, limitKiB: *limit, verbose: *verbose, noUTP: *noUTP})
+	return seedTorrent(tf, fs.Arg(1), seedOptions{port: *port, limitKiB: *limit, verbose: *verbose, noUTP: *noUTP, encryption: policy})
 }
 
 type seedOptions struct {
-	port     int
-	limitKiB int64
-	verbose  bool
-	noUTP    bool
+	port       int
+	limitKiB   int64
+	verbose    bool
+	noUTP      bool
+	encryption mse.Policy
 }
 
 // seedTorrent verifies the data at path, then serves it to peers and keeps
@@ -66,7 +73,7 @@ func seedUntil(tf *torrentfile.TorrentFile, path string, o seedOptions, stop <-c
 	srv := &seed.Server{
 		InfoHash: tf.InfoHash, PeerID: peerID, PieceHashes: tf.PieceHashes,
 		PieceLength: tf.PieceLength, Length: tf.Length, Data: st, Info: tf.InfoBytes,
-		RateLimit: limitKiB * 1024,
+		RateLimit: limitKiB * 1024, Encryption: o.encryption,
 	}
 	if verbose {
 		srv.Logger = log.New(clearLine{os.Stdout}, "  ", log.Ltime)
