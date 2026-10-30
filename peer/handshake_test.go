@@ -2,7 +2,9 @@ package peer
 
 import (
 	"bytes"
+	"net"
 	"testing"
+	"time"
 )
 
 func TestHandshakeSerialize(t *testing.T) {
@@ -78,5 +80,40 @@ func TestExtendedMessageRoundTrip(t *testing.T) {
 	id, dict, trailing, err := ParseExtended(parsed)
 	if err != nil || id != 3 || dict["piece"] != int64(0) || string(trailing) != "raw-bytes" {
 		t.Fatalf("got id=%d dict=%v trailing=%q err=%v", id, dict, trailing, err)
+	}
+}
+
+// A read deadline that fires halfway through a message must not lose the
+// bytes already received: the next Read finishes that message.
+func TestReadSurvivesTimeoutMidMessage(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	c := &Client{Conn: a}
+	wire := FormatHave(42).Serialize()
+
+	go b.Write(wire[:3]) // length prefix only partly sent
+	a.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	if _, err := c.Read(); err == nil {
+		t.Fatal("expected a timeout")
+	}
+	a.SetReadDeadline(time.Time{})
+	go b.Write(wire[3:])
+	msg, err := c.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idx, err := ParseHave(msg); err != nil || idx != 42 {
+		t.Fatalf("got %v (%v), want HAVE 42", msg, err)
+	}
+}
+
+func TestReadRejectsHugeLength(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	go b.Write([]byte{0xff, 0xff, 0xff, 0xff})
+	if _, err := (&Client{Conn: a}).Read(); err == nil {
+		t.Fatal("a 4 GiB length prefix was accepted")
 	}
 }

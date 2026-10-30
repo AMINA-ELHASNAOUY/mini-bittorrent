@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"mini-bittorrent/internal/ratelimit"
 	"mini-bittorrent/peer"
 )
 
@@ -44,7 +45,7 @@ type Server struct {
 
 	bitfield   peer.Bitfield
 	uploaded   atomic.Int64
-	limiter    *rateLimiter
+	limiter    *ratelimit.Limiter
 	ln         net.Listener
 	wg         sync.WaitGroup
 	mu         sync.Mutex
@@ -131,7 +132,7 @@ func (s *Server) Listen(addr string) error {
 		s.RechokeInterval = 10 * time.Second
 	}
 	if s.RateLimit > 0 {
-		s.limiter = newRateLimiter(s.RateLimit)
+		s.limiter = ratelimit.New(s.RateLimit)
 	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -363,7 +364,7 @@ func (s *Server) serveRequest(r *remote, msg *peer.Message) error {
 		return err
 	}
 	if s.limiter != nil {
-		s.limiter.wait(int(length))
+		s.limiter.Wait(int(length))
 	}
 	if err := r.send(&peer.Message{ID: peer.MsgPiece, Payload: payload}); err != nil {
 		return err

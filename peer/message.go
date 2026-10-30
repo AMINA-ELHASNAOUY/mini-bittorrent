@@ -50,6 +50,9 @@ func ReadMessage(r io.Reader) (*Message, error) {
 	if length == 0 {
 		return nil, nil // keep-alive
 	}
+	if length > MaxMessageLen {
+		return nil, fmt.Errorf("message of %d bytes is too large", length)
+	}
 
 	messageBuf := make([]byte, length)
 	if _, err := io.ReadFull(r, messageBuf); err != nil {

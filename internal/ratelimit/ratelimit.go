@@ -1,13 +1,14 @@
-package seed
+// Package ratelimit caps total upload bandwidth across connections.
+package ratelimit
 
 import (
 	"sync"
 	"time"
 )
 
-// rateLimiter is a token bucket shared by every connection: tokens (bytes)
+// Limiter is a token bucket shared by every connection: tokens (bytes)
 // refill at `rate` per second, and sending n bytes waits until n are available.
-type rateLimiter struct {
+type Limiter struct {
 	mu     sync.Mutex
 	rate   float64
 	burst  float64
@@ -15,15 +16,17 @@ type rateLimiter struct {
 	last   time.Time
 }
 
-func newRateLimiter(bytesPerSecond int64) *rateLimiter {
+// New returns a limiter allowing bytesPerSecond.
+func New(bytesPerSecond int64) *Limiter {
 	burst := float64(bytesPerSecond) / 4 // a quarter second of traffic
 	if burst < 128<<10 {
 		burst = 128 << 10 // must fit the largest block we serve
 	}
-	return &rateLimiter{rate: float64(bytesPerSecond), burst: burst, tokens: burst, last: time.Now()}
+	return &Limiter{rate: float64(bytesPerSecond), burst: burst, tokens: burst, last: time.Now()}
 }
 
-func (l *rateLimiter) wait(n int) {
+// Wait blocks until n bytes may be sent.
+func (l *Limiter) Wait(n int) {
 	l.mu.Lock()
 	now := time.Now()
 	l.tokens += now.Sub(l.last).Seconds() * l.rate
