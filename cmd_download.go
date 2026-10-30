@@ -37,6 +37,7 @@ type fetchOptions struct {
 	noUpload   bool     // don't upload while downloading
 	limitKiB   int64    // upload limit
 	encryption mse.Policy
+	noPortMap  bool
 }
 
 // lingerAfterDownload is how long we keep serving peers that are still
@@ -54,6 +55,7 @@ func runDownload(args []string) error {
 	noUTP := fs.Bool("noutp", false, "use TCP only, no uTP")
 	noUpload := fs.Bool("noupload", false, "don't upload to other peers while downloading")
 	encryption := fs.String("encryption", "prefer", "protocol encryption (MSE/PE): prefer, require or off")
+	noPortMap := fs.Bool("noportmap", false, "don't ask the router to forward the port (NAT-PMP / UPnP)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -62,10 +64,10 @@ func runDownload(args []string) error {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return errors.New(`usage: mini-bittorrent download [-o path] [-v] [-seed] [-port N] [-limit KiB/s] [-nodht] [-noutp] [-noupload] [-encryption prefer|require|off] <file.torrent | "magnet:?...">`)
+		return errors.New(`usage: mini-bittorrent download [-o path] [-v] [-seed] [-port N] [-limit KiB/s] [-nodht] [-noutp] [-noupload] [-encryption prefer|require|off] [-noportmap] <file.torrent | "magnet:?...">`)
 	}
 	opts := fetchOptions{verbose: *verbose, noDHT: *noDHT, port: *port, noUTP: *noUTP, noUpload: *noUpload,
-		limitKiB: *limit, encryption: policy}
+		limitKiB: *limit, encryption: policy, noPortMap: *noPortMap}
 
 	var tf *torrentfile.TorrentFile
 	if arg := fs.Arg(0); strings.HasPrefix(arg, "magnet:") {
@@ -95,7 +97,7 @@ func runDownload(args []string) error {
 		return err
 	}
 	if *seedAfter {
-		return seedTorrent(tf, *outPath, seedOptions{port: *port, limitKiB: *limit, verbose: *verbose, noUTP: *noUTP, encryption: policy})
+		return seedTorrent(tf, *outPath, seedOptions{port: *port, limitKiB: *limit, verbose: *verbose, noUTP: *noUTP, encryption: policy, noPortMap: *noPortMap})
 	}
 	return nil
 }
@@ -271,6 +273,7 @@ func fetch(tf *torrentfile.TorrentFile, outPath string, opts fetchOptions) error
 	}
 	defer tr.Close()
 	opts.port = tr.port
+	defer startPortMapping(tr.port, !opts.noUTP, !opts.noUpload && !opts.noPortMap, opts.verbose)()
 	t.Dial = tr.Dial
 	t.Encryption = opts.encryption
 	if !opts.noUpload {

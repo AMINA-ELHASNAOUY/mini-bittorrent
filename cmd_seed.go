@@ -26,6 +26,7 @@ func runSeed(args []string) error {
 	limit := fs.Int64("limit", 0, "upload limit in KiB/s (0 = unlimited)")
 	noUTP := fs.Bool("noutp", false, "accept TCP only, no uTP")
 	encryption := fs.String("encryption", "prefer", "protocol encryption (MSE/PE): prefer (accept both), require or off")
+	noPortMap := fs.Bool("noportmap", false, "don't ask the router to forward the port (NAT-PMP / UPnP)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -34,13 +35,13 @@ func runSeed(args []string) error {
 		return err
 	}
 	if fs.NArg() != 2 {
-		return errors.New("usage: mini-bittorrent seed [-port N] [-limit KiB/s] [-noutp] [-encryption prefer|require|off] [-v] <file.torrent> <path to the downloaded file or folder>")
+		return errors.New("usage: mini-bittorrent seed [-port N] [-limit KiB/s] [-noutp] [-encryption prefer|require|off] [-noportmap] [-v] <file.torrent> <path to the downloaded file or folder>")
 	}
 	tf, err := torrentfile.Open(fs.Arg(0))
 	if err != nil {
 		return err
 	}
-	return seedTorrent(tf, fs.Arg(1), seedOptions{port: *port, limitKiB: *limit, verbose: *verbose, noUTP: *noUTP, encryption: policy})
+	return seedTorrent(tf, fs.Arg(1), seedOptions{port: *port, limitKiB: *limit, verbose: *verbose, noUTP: *noUTP, encryption: policy, noPortMap: *noPortMap})
 }
 
 type seedOptions struct {
@@ -49,6 +50,7 @@ type seedOptions struct {
 	verbose    bool
 	noUTP      bool
 	encryption mse.Policy
+	noPortMap  bool
 }
 
 // seedTorrent verifies the data at path, then serves it to peers and keeps
@@ -96,8 +98,8 @@ func seedUntil(tf *torrentfile.TorrentFile, path string, o seedOptions, stop <-c
 	if o.noUTP {
 		transports = "TCP"
 	}
-	fmt.Printf("→ seeding %d/%d pieces on port %d, %s (peers behind your router can only reach you if this port is forwarded)\n",
-		srv.Have(), len(tf.PieceHashes), srv.Port(), transports)
+	fmt.Printf("→ seeding %d/%d pieces on port %d, %s\n", srv.Have(), len(tf.PieceHashes), srv.Port(), transports)
+	defer startPortMapping(int(srv.Port()), !o.noUTP, !o.noPortMap, verbose)()
 	if limitKiB > 0 {
 		fmt.Printf("→ upload limited to %d KiB/s, uploading to %d peers at a time\n", limitKiB, 4)
 	}

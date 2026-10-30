@@ -138,6 +138,9 @@ func TestTorrentFallsBackToDHTWhenTrackersFail(t *testing.T) {
 	}
 }
 
+// The tests must not talk to whatever router the machine running them is behind.
+func init() { portMapping = false }
+
 func TestSeedTrackerlessThenDownloadByMagnetOverDHT(t *testing.T) {
 	inTempDir(t)
 	// A small local DHT: 6 full nodes bootstrapped off the first one.

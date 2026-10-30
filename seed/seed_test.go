@@ -61,6 +61,11 @@ func TestDownloaderFetchesFromSeeder(t *testing.T) {
 	if !bytes.Equal(out.buf, data) {
 		t.Fatal("downloaded data differs")
 	}
+	// The seeder counts a block after its write returns, which can be just
+	// after the downloader has already received it: give it a moment.
+	for deadline := time.Now().Add(2 * time.Second); s.Uploaded() < int64(len(data)) && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
+	}
 	if s.Uploaded() != int64(len(data)) {
 		t.Errorf("Uploaded = %d, want %d", s.Uploaded(), len(data))
 	}
@@ -295,6 +300,9 @@ func TestDownloadOverUTP(t *testing.T) {
 	}
 	if !bytes.Equal(out.buf, data) {
 		t.Fatal("downloaded data differs")
+	}
+	for deadline := time.Now().Add(2 * time.Second); s.Uploaded() < int64(len(data)) && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
 	}
 	if s.Uploaded() < int64(len(data)) {
 		t.Fatalf("seeder reports %d bytes uploaded, want at least %d", s.Uploaded(), len(data))
