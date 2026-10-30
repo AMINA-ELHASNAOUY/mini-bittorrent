@@ -46,7 +46,7 @@ const (
 
 // Client sends KRPC queries over one UDP socket.
 type Client struct {
-	conn *net.UDPConn
+	conn net.PacketConn
 	id   [20]byte
 
 	mu      sync.Mutex
@@ -69,6 +69,11 @@ func open(addr string, full bool) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	return openOn(conn, full)
+}
+
+func openOn(conn net.PacketConn, full bool) (*Client, error) {
+	var err error
 	c := &Client{conn: conn, pending: map[string]chan map[string]interface{}{}, closed: make(chan struct{})}
 	if _, err := rand.Read(c.id[:]); err != nil {
 		conn.Close()
@@ -97,9 +102,13 @@ func (c *Client) Close() error {
 func (c *Client) readLoop() {
 	buf := make([]byte, 65536)
 	for {
-		n, from, err := c.conn.ReadFromUDP(buf)
+		n, addr, err := c.conn.ReadFrom(buf)
 		if err != nil {
 			return
+		}
+		from, ok := addr.(*net.UDPAddr)
+		if !ok {
+			continue
 		}
 		v, err := bencode.Decode(bufioFrom(buf[:n]))
 		if err != nil {
@@ -149,7 +158,7 @@ func (c *Client) query(ctx context.Context, addr *net.UDPAddr, method string, ar
 	if err != nil {
 		return nil, err
 	}
-	if _, err := c.conn.WriteToUDP(pkt, addr); err != nil {
+	if _, err := c.conn.WriteTo(pkt, addr); err != nil {
 		return nil, err
 	}
 

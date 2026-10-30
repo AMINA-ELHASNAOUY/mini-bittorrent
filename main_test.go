@@ -174,7 +174,7 @@ func TestSeedTrackerlessThenDownloadByMagnetOverDHT(t *testing.T) {
 	}
 	stop := make(chan struct{})
 	done := make(chan error, 1)
-	go func() { done <- seedUntil(tf, "song.flac", 0, 0, false, stop) }()
+	go func() { done <- seedUntil(tf, "song.flac", seedOptions{}, stop) }()
 	defer func() { close(stop); <-done }()
 
 	// Wait until the seeder's DHT announce has landed somewhere.

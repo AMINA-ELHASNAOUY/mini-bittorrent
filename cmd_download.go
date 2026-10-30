@@ -29,23 +29,33 @@ type fetchOptions struct {
 	verbose    bool
 	noDHT      bool     // never use the DHT
 	extraPeers []string // peers already known (e.g. from fetching magnet metadata)
+	port       int      // port to accept peers on while downloading (announced to trackers)
+	noUTP      bool     // TCP only
+	noUpload   bool     // don't upload while downloading
+	limitKiB   int64    // upload limit
 }
+
+// lingerAfterDownload is how long we keep serving peers that are still
+// downloading from us once our own download is complete.
+const lingerAfterDownload = 15 * time.Second
 
 func runDownload(args []string) error {
 	fs := flag.NewFlagSet("download", flag.ContinueOnError)
 	outPath := fs.String("o", "", "output file or folder (default: the name inside the torrent)")
 	verbose := fs.Bool("v", false, "log per-peer events")
 	seedAfter := fs.Bool("seed", false, "keep seeding after the download finishes (Ctrl+C to stop)")
-	port := fs.Int("port", 6881, "port to seed on (with -seed)")
-	limit := fs.Int64("limit", 0, "upload limit in KiB/s while seeding (with -seed)")
+	port := fs.Int("port", 6881, "TCP/uTP port to accept peers on")
+	limit := fs.Int64("limit", 0, "upload limit in KiB/s (0 = unlimited)")
 	noDHT := fs.Bool("nodht", false, "don't look for peers in the DHT")
+	noUTP := fs.Bool("noutp", false, "use TCP only, no uTP")
+	noUpload := fs.Bool("noupload", false, "don't upload to other peers while downloading")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return errors.New(`usage: mini-bittorrent download [-o path] [-v] [-seed] [-nodht] <file.torrent | "magnet:?...">`)
+		return errors.New(`usage: mini-bittorrent download [-o path] [-v] [-seed] [-port N] [-limit KiB/s] [-nodht] [-noutp] [-noupload] <file.torrent | "magnet:?...">`)
 	}
-	opts := fetchOptions{verbose: *verbose, noDHT: *noDHT}
+	opts := fetchOptions{verbose: *verbose, noDHT: *noDHT, port: *port, noUTP: *noUTP, noUpload: *noUpload, limitKiB: *limit}
 
 	var tf *torrentfile.TorrentFile
 	var err error
@@ -76,7 +86,7 @@ func runDownload(args []string) error {
 		return err
 	}
 	if *seedAfter {
-		return seedTorrent(tf, *outPath, *port, *limit, *verbose)
+		return seedTorrent(tf, *outPath, seedOptions{port: *port, limitKiB: *limit, verbose: *verbose, noUTP: *noUTP})
 	}
 	return nil
 }
@@ -164,7 +174,7 @@ func findPeers(infoHash, peerID [20]byte, trackers []string, left int64, alwaysD
 	if len(trackers) > 0 {
 		fmt.Printf("→ asking %d tracker(s) for peers…\n", len(trackers))
 		found, errs := tracker.AnnounceAll(trackers, tracker.Request{
-			InfoHash: infoHash, PeerID: peerID, Port: 6881, Left: left,
+			InfoHash: infoHash, PeerID: peerID, Port: uint16(opts.port), Left: left,
 		}, 3*time.Second)
 		if opts.verbose {
 			for _, e := range errs {
@@ -231,6 +241,26 @@ func fetch(tf *torrentfile.TorrentFile, outPath string, opts fetchOptions) error
 		PeerID: peerID, InfoHash: tf.InfoHash, PieceHashes: tf.PieceHashes,
 		PieceLength: tf.PieceLength, Length: tf.Length,
 	}
+
+	// Accept peers while we download (TCP and uTP on one port number), so
+	// we can upload pieces we already have: that is what earns us faster
+	// uploads from others under tit-for-tat.
+	tr, err := listenTransport(opts.port, !opts.noUTP)
+	if err != nil {
+		return err
+	}
+	defer tr.Close()
+	opts.port = tr.port
+	t.Dial = tr.Dial
+	if !opts.noUpload {
+		t.Data = st
+		t.Listener = tr.Listener()
+		t.UploadLimit = opts.limitKiB * 1024
+		t.Linger = lingerAfterDownload
+		t.OnLinger = func(n int) {
+			fmt.Printf("→ finishing uploads to %d peer(s) still downloading from us (up to %s)\n", n, lingerAfterDownload)
+		}
+	}
 	have, resumed, err := t.CheckPieces(st)
 	if err != nil {
 		return err
@@ -247,7 +277,11 @@ func fetch(tf *torrentfile.TorrentFile, outPath string, opts fetchOptions) error
 				return err
 			}
 		}
-		fmt.Printf("→ connecting to %d peers\n", len(t.Peers))
+		transports := "TCP + uTP"
+		if opts.noUTP {
+			transports = "TCP"
+		}
+		fmt.Printf("→ connecting to %d peers (%s), accepting peers on port %d\n", len(t.Peers), transports, tr.port)
 	}
 	if opts.verbose {
 		t.Logger = log.New(clearLine{os.Stdout}, "  ", log.Ltime)
@@ -255,8 +289,12 @@ func fetch(tf *torrentfile.TorrentFile, outPath string, opts fetchOptions) error
 
 	start := time.Now()
 	err = t.Download(st, func(p download.Progress) {
-		fmt.Printf("\r  %s %5.1f%%  %d/%d pieces  %d peers ", bar(p.Done, p.Total, 30),
-			100*float64(p.Done)/float64(p.Total), p.Done, p.Total, p.Peers)
+		up := ""
+		if p.Uploaded > 0 {
+			up = "  ↑ " + humanBytes(p.Uploaded)
+		}
+		fmt.Printf("\r  %s %5.1f%%  %d/%d pieces  %d peers%s ", bar(p.Done, p.Total, 30),
+			100*float64(p.Done)/float64(p.Total), p.Done, p.Total, p.Peers, up)
 	})
 	fmt.Println()
 	if err != nil {
@@ -277,5 +315,8 @@ func fetch(tf *torrentfile.TorrentFile, outPath string, opts fetchOptions) error
 	speed := float64(fetched) / elapsed.Seconds()
 	fmt.Printf("✓ saved %s, all %d pieces SHA-1 verified (%s downloaded in %s, %s/s)\n",
 		outPath, len(tf.PieceHashes), humanBytes(fetched), elapsed.Round(time.Millisecond), humanBytes(int64(speed)))
+	if up := t.Uploaded(); up > 0 {
+		fmt.Printf("  ↑ uploaded %s to other peers\n", humanBytes(up))
+	}
 	return nil
 }

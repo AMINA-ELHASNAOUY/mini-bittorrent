@@ -12,6 +12,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"mini-bittorrent/peer"
@@ -61,7 +62,16 @@ type Torrent struct {
 	// our own download completes, until they lose interest or this much
 	// time passes (default 0: return as soon as the last piece is written).
 	Linger time.Duration
+	// OnLinger (optional) is called when lingering starts, with the number
+	// of peers still downloading from us.
+	OnLinger func(peers int)
+
+	uploaded atomic.Int64
 }
+
+// Uploaded reports the bytes uploaded to peers so far (safe to call while
+// Download runs, and afterwards for the total).
+func (t *Torrent) Uploaded() int64 { return t.uploaded.Load() }
 
 // maxInbound caps how many incoming peers we accept during a download.
 const maxInbound = 30
@@ -190,7 +200,10 @@ func (t *Torrent) Download(out io.WriterAt, onProgress func(Progress)) error {
 	}
 	if sw.uploading() {
 		sw.finished()
-		if t.Linger > 0 {
+		if n := sw.interestedPeers(); n > 0 && t.Linger > 0 {
+			if t.OnLinger != nil {
+				t.OnLinger(n)
+			}
 			sw.linger(t.Linger)
 		}
 	}
@@ -277,6 +290,14 @@ func (t *Torrent) runWorker(c *peer.Client, sent peer.Bitfield, sw *swarm, pk *p
 	defer func() { pk.removePeer(c.Bitfield) }()
 	t.logf("peer %s: connected", addr)
 	w := &worker{t: t, c: c, pc: pc, sw: sw, pk: pk}
+	// Errors after the download ended are just us hanging up: don't log them.
+	logf := func(format string, args ...interface{}) {
+		select {
+		case <-stop:
+		default:
+			t.logf(format, args...)
+		}
+	}
 
 	c.SendInterested()
 
@@ -293,7 +314,7 @@ func (t *Torrent) runWorker(c *peer.Client, sent peer.Bitfield, sw *swarm, pk *p
 			// Nothing to fetch from this peer right now: listen for HAVE
 			// messages (and serve its requests) for a moment, then ask again.
 			if err := w.idle(time.Second); err != nil {
-				t.logf("peer %s: %v", addr, err)
+				logf("peer %s: %v", addr, err)
 				return
 			}
 			continue
@@ -306,7 +327,7 @@ func (t *Torrent) runWorker(c *peer.Client, sent peer.Bitfield, sw *swarm, pk *p
 		}
 		if err != nil {
 			pk.release(index)
-			t.logf("peer %s: piece %d failed: %v", addr, index, err)
+			logf("peer %s: piece %d failed: %v", addr, index, err)
 			return
 		}
 		if sha1.Sum(buf) != t.PieceHashes[index] {

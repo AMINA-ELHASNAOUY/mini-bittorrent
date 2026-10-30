@@ -12,6 +12,7 @@ import (
 
 	"mini-bittorrent/download"
 	"mini-bittorrent/peer"
+	"mini-bittorrent/utp"
 )
 
 type memFile struct{ buf []byte }
@@ -257,5 +258,45 @@ func TestRateLimit(t *testing.T) {
 	}
 	if elapsed > 4*time.Second {
 		t.Errorf("rate limiting is far too slow: %s", elapsed)
+	}
+}
+
+// The whole peer wire protocol over uTP: our seeder accepts on a uTP socket
+// and our downloader dials over uTP only, with TCP never involved.
+func TestDownloadOverUTP(t *testing.T) {
+	data := make([]byte, 40*16384+999)
+	rand.Read(data)
+	s := newServer(t, data, 16384)
+	if err := s.Verify(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Listen("127.0.0.1:0"); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	sock, err := utp.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Serve(sock)
+
+	client, err := utp.NewSocket("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	tor := &download.Torrent{InfoHash: s.InfoHash, PieceHashes: s.PieceHashes, PieceLength: s.PieceLength,
+		Length: s.Length, Peers: []string{sock.Addr().String()},
+		Dial: func(addr string) (net.Conn, error) { return client.Dial(addr, 3*time.Second) }}
+	copy(tor.PeerID[:], "-MB0001-utputputputp")
+	out := &memFile{buf: make([]byte, len(data))}
+	if err := tor.Download(out, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(out.buf, data) {
+		t.Fatal("downloaded data differs")
+	}
+	if s.Uploaded() < int64(len(data)) {
+		t.Fatalf("seeder reports %d bytes uploaded, want at least %d", s.Uploaded(), len(data))
 	}
 }

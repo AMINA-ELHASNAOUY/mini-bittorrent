@@ -47,6 +47,7 @@ type Server struct {
 	uploaded   atomic.Int64
 	limiter    *ratelimit.Limiter
 	ln         net.Listener
+	extra      []net.Listener
 	wg         sync.WaitGroup
 	mu         sync.Mutex
 	conns      map[*remote]struct{}
@@ -143,9 +144,25 @@ func (s *Server) Listen(addr string) error {
 	s.stop = make(chan struct{})
 	s.rechokeNow = make(chan struct{}, 1)
 	s.wg.Add(2)
-	go s.acceptLoop()
+	go s.acceptLoop(ln)
 	go s.chokeLoop()
 	return nil
+}
+
+// Serve also accepts peers from ln, e.g. a uTP socket, alongside the TCP
+// listener opened by Listen (which must be called first). The server takes
+// ownership of ln and closes it in Close.
+func (s *Server) Serve(ln net.Listener) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		ln.Close()
+		return
+	}
+	s.extra = append(s.extra, ln)
+	s.wg.Add(1)
+	s.mu.Unlock()
+	go s.acceptLoop(ln)
 }
 
 // Addr is the address the server is listening on.
@@ -154,10 +171,10 @@ func (s *Server) Addr() net.Addr { return s.ln.Addr() }
 // Port is the TCP port the server is listening on.
 func (s *Server) Port() uint16 { return uint16(s.ln.Addr().(*net.TCPAddr).Port) }
 
-func (s *Server) acceptLoop() {
+func (s *Server) acceptLoop(ln net.Listener) {
 	defer s.wg.Done()
 	for {
-		conn, err := s.ln.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
@@ -201,7 +218,11 @@ func (s *Server) Close() {
 	for r := range s.conns {
 		r.conn.Close()
 	}
+	extra := s.extra
 	s.mu.Unlock()
+	for _, ln := range extra {
+		ln.Close()
+	}
 	if s.ln != nil {
 		s.ln.Close()
 		close(s.stop)

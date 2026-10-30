@@ -223,10 +223,12 @@ func (c *Conn) handle(h *header, payload []byte) {
 		return
 	}
 	if c.state == stateSynSent {
-		if h.typ != stState {
+		if h.typ != stState && h.typ != stData {
 			return
 		}
-		c.ack = h.seq - 1 // the reply carries the seq_nr of its first data packet
+		// The reply carries the seq_nr of the acceptor's first data packet.
+		// If that STATE was lost, its first DATA packet tells us the same.
+		c.ack = h.seq - 1
 		c.connected()
 	}
 	c.processAck(h, len(payload))
@@ -576,7 +578,8 @@ func (c *Conn) Write(b []byte) (int, error) {
 			case c.err != nil:
 				return total, c.err
 			}
-			if c.state == stateConnected && c.canSend(n) {
+			// The accepting side may send as soon as it has replied to the SYN.
+			if (c.state == stateConnected || c.state == stateSynRecv) && c.canSend(n) {
 				break
 			}
 			if err := c.waitLocked(c.writeDeadline); err != nil {

@@ -330,3 +330,23 @@ func TestLEDBATBacksOffWhenDelayRises(t *testing.T) {
 		t.Fatalf("window didn't shrink above the target: %v -> %v", grown, c.cwnd)
 	}
 }
+
+// The accepting side may speak first (it doesn't wait for the dialer's data).
+func TestAcceptorCanWriteFirst(t *testing.T) {
+	client, server := pair(t, nil)
+	go func() {
+		c, err := server.Accept()
+		if err == nil {
+			c.Write([]byte("welcome"))
+		}
+	}()
+	c, err := client.Dial(server.Addr().String(), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	got, err := readN(c, 7)
+	if err != nil || string(got) != "welcome" {
+		t.Fatalf("got %q, %v", got, err)
+	}
+}

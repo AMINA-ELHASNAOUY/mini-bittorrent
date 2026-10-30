@@ -44,6 +44,11 @@ type server struct {
 // NewNode opens a UDP socket (addr like ":6881") and runs a full DHT node on it.
 func NewNode(addr string) (*Client, error) { return open(addr, true) }
 
+// NewNodeOn runs a full node on an existing packet connection, e.g. the
+// non-uTP side of a uTP socket, so the DHT and uTP share one port as other
+// clients expect. Close closes pc.
+func NewNodeOn(pc net.PacketConn) (*Client, error) { return openOn(pc, true) }
+
 func newServer(self [20]byte) (*server, error) {
 	srv := &server{table: newRoutingTable(self), store: newPeerStore(), rotatedAt: time.Now()}
 	if _, err := rand.Read(srv.secret[:]); err != nil {
@@ -173,7 +178,7 @@ func (c *Client) send(to *net.UDPAddr, m map[string]interface{}) {
 	}
 	pkt, err := bencode.Encode(m)
 	if err == nil {
-		c.conn.WriteToUDP(pkt, to)
+		c.conn.WriteTo(pkt, to)
 	}
 }
 

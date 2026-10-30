@@ -28,7 +28,7 @@ type swarm struct {
 	limiter     *ratelimit.Limiter
 	maxUnchoked int
 	snubTimeout time.Duration
-	uploaded    atomic.Int64
+	uploaded    *atomic.Int64 // Torrent.uploaded
 
 	mu         sync.Mutex
 	have       peer.Bitfield // pieces written to disk and verified
@@ -62,6 +62,7 @@ func newSwarm(t *Torrent, completed []bool) *swarm {
 		numPieces:   len(t.PieceHashes),
 		maxUnchoked: t.MaxUnchoked,
 		snubTimeout: t.SnubTimeout,
+		uploaded:    &t.uploaded,
 		have:        make(peer.Bitfield, (len(t.PieceHashes)+7)/8),
 		conns:       map[*conn]struct{}{},
 		ids:         map[[20]byte]bool{t.PeerID: true}, // never connect to ourselves

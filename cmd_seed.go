@@ -15,6 +15,7 @@ import (
 	"mini-bittorrent/storage"
 	"mini-bittorrent/torrentfile"
 	"mini-bittorrent/tracker"
+	"mini-bittorrent/utp"
 )
 
 func runSeed(args []string) error {
@@ -22,27 +23,36 @@ func runSeed(args []string) error {
 	port := fs.Int("port", 6881, "TCP port to accept peers on")
 	verbose := fs.Bool("v", false, "log per-peer events")
 	limit := fs.Int64("limit", 0, "upload limit in KiB/s (0 = unlimited)")
+	noUTP := fs.Bool("noutp", false, "accept TCP only, no uTP")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 2 {
-		return errors.New("usage: mini-bittorrent seed [-port N] [-limit KiB/s] [-v] <file.torrent> <path to the downloaded file or folder>")
+		return errors.New("usage: mini-bittorrent seed [-port N] [-limit KiB/s] [-noutp] [-v] <file.torrent> <path to the downloaded file or folder>")
 	}
 	tf, err := torrentfile.Open(fs.Arg(0))
 	if err != nil {
 		return err
 	}
-	return seedTorrent(tf, fs.Arg(1), *port, *limit, *verbose)
+	return seedTorrent(tf, fs.Arg(1), seedOptions{port: *port, limitKiB: *limit, verbose: *verbose, noUTP: *noUTP})
+}
+
+type seedOptions struct {
+	port     int
+	limitKiB int64
+	verbose  bool
+	noUTP    bool
 }
 
 // seedTorrent verifies the data at path, then serves it to peers and keeps
 // the trackers informed until Ctrl+C.
-func seedTorrent(tf *torrentfile.TorrentFile, path string, port int, limitKiB int64, verbose bool) error {
-	return seedUntil(tf, path, port, limitKiB, verbose, nil)
+func seedTorrent(tf *torrentfile.TorrentFile, path string, o seedOptions) error {
+	return seedUntil(tf, path, o, nil)
 }
 
 // seedUntil is seedTorrent that also stops when stop is closed (used by tests).
-func seedUntil(tf *torrentfile.TorrentFile, path string, port int, limitKiB int64, verbose bool, stop <-chan struct{}) error {
+func seedUntil(tf *torrentfile.TorrentFile, path string, o seedOptions, stop <-chan struct{}) error {
+	port, limitKiB, verbose := o.port, o.limitKiB, o.verbose
 	st, err := storage.OpenExisting(path, tf)
 	if err != nil {
 		return err
@@ -75,18 +85,36 @@ func seedUntil(tf *torrentfile.TorrentFile, path string, port int, limitKiB int6
 		}
 	}
 	defer srv.Close()
-	fmt.Printf("→ seeding %d/%d pieces on port %d (peers behind your router can only reach you if this port is forwarded)\n",
-		srv.Have(), len(tf.PieceHashes), srv.Port())
+	transports := "TCP + uTP"
+	if o.noUTP {
+		transports = "TCP"
+	}
+	fmt.Printf("→ seeding %d/%d pieces on port %d, %s (peers behind your router can only reach you if this port is forwarded)\n",
+		srv.Have(), len(tf.PieceHashes), srv.Port(), transports)
 	if limitKiB > 0 {
 		fmt.Printf("→ upload limited to %d KiB/s, uploading to %d peers at a time\n", limitKiB, 4)
 	}
 
-	// Run a full DHT node on the same port number (UDP), so peers can find us
-	// even without a tracker, and so we help route other people's lookups.
-	node, err := dht.NewNode(fmt.Sprintf(":%d", srv.Port()))
+	// uTP and a full DHT node share the same port number over UDP, as other
+	// clients expect: peers can reach us over uTP, find us without a
+	// tracker, and we help route other people's DHT lookups.
+	var node *dht.Client
+	var sock *utp.Socket
+	if !o.noUTP {
+		if sock, err = utp.Listen(fmt.Sprintf(":%d", srv.Port())); err != nil {
+			fmt.Printf("  uTP unavailable (%v); TCP only\n", err)
+		} else {
+			srv.Serve(sock) // closed by srv.Close
+			node, err = dht.NewNodeOn(sock.PacketConn())
+		}
+	}
+	if sock == nil {
+		node, err = dht.NewNode(fmt.Sprintf(":%d", srv.Port()))
+	}
 	if err != nil {
 		fmt.Printf("  DHT unavailable (%v); trackers only\n", err)
-	} else {
+		node = nil
+	} else if node != nil {
 		defer node.Close()
 	}
 

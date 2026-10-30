@@ -37,22 +37,17 @@ type packet struct {
 }
 
 // Listen opens a UDP socket on addr (e.g. ":6881") that accepts incoming uTP connections.
-func Listen(addr string) (*Socket, error) {
-	s, err := NewSocket(addr)
-	if err != nil {
-		return nil, err
-	}
-	s.listening = true
-	return s, nil
-}
+func Listen(addr string) (*Socket, error) { return open(addr, true) }
 
 // NewSocket opens a UDP socket for outgoing connections only.
-func NewSocket(addr string) (*Socket, error) {
+func NewSocket(addr string) (*Socket, error) { return open(addr, false) }
+
+func open(addr string, listen bool) (*Socket, error) {
 	pc, err := net.ListenPacket("udp", addr)
 	if err != nil {
 		return nil, err
 	}
-	return NewSocketOn(pc, false), nil
+	return NewSocketOn(pc, listen), nil
 }
 
 // NewSocketOn runs uTP on an existing packet connection (useful in tests,
